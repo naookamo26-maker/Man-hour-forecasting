@@ -25,7 +25,7 @@ from src.data_loader import load_all
 from src.excel_writer import write_workbook
 from src.forecast import forecast
 from src.learning import (aggregate_actuals, build_project_curves, group_names,
-                          learn)
+                          learn, project_monthly)
 from src.validation import leave_one_out
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +48,11 @@ def parse_args(argv=None):
                    help="背骨マイルストーン名を ; 区切りで指定。既定は 自動")
     p.add_argument("--backbone-coverage", type=float, default=None,
                    help="背骨に採用するマイルストーンの最小カバー率(0〜1)")
+    p.add_argument("--exclude-group", default=None,
+                   help="この案件が行わない行程グループを ; 区切りで指定し、予測から外す。"
+                        "estimates シートに見積もりがある場合は、そちらが優先される")
+    p.add_argument("--ignore-estimates", action="store_true",
+                   help="estimates シートの見積もりを使わず、契約人月と学習比率だけで予測する")
     p.add_argument("--out", default=None, help="出力Excelのパス")
     p.add_argument("--no-validate", action="store_true", help="leave-one-out を実行しない")
     p.add_argument("--no-cache", action="store_true", help="実績のparquetキャッシュを使わない")
@@ -158,10 +163,24 @@ def _run(argv=None) -> int:
             print("[エラー] ステータス=予測対象 の案件がありません。--target で指定してください。")
             return 1
         target = str(tp.iloc[0]["案件ID"])
-    fc = forecast(model, ds, target)
+
+    # 着手前の案件は実績が1行も無く、分かっているのは要素別の見積もりだけになる。
+    # 見積もりがあればそれをグループ別総量の正とし、無ければ契約人月を学習比率で割る。
+    est = {} if a.ignore_estimates else ds.estimates_of(target)
+    excl = [s.strip() for s in (a.exclude_group or "").split(";") if s.strip()]
+    fc = forecast(model, ds, target, group_totals=est or None, exclude_groups=excl)
+
+    src = "見積もり(estimates)" if est else "契約人月 + 学習比率"
     print(f"[4/5] 予測      {target} {fc.name}  "
           f"{fc.months[0]}〜{fc.months[-1]} ({len(fc.months)}ヶ月) / "
           f"{fc.total_hours:,.0f} 時間 = {fc.total_hours/hpm:,.0f} 人月")
+    print(f"                総量の根拠: {src} / 行程グループ {len(fc.groups)}/{len(groups)}")
+    dropped = [g for g in groups if g not in fc.groups]
+    if dropped:
+        print(f"                予測から除外: {', '.join(dropped)}")
+
+    # 予測対象が進行中なら、同じ月軸・同じ集計で実績を並べて比較できるようにする。
+    actual_table = project_monthly(agg, target, fc.months, fc.groups)
 
     # --- 検証 ---
     if a.no_validate:
@@ -199,14 +218,17 @@ def _run(argv=None) -> int:
         "カーブ解像度": n_bin,
         "人月換算係数": hpm,
         "学習案件数": len(curves),
-        "実装範囲": "実装順序 1〜2(素朴版 + マイルストーン位置合わせ)",
+        "総量の根拠": src,
+        "予測した行程グループ": ", ".join(fc.groups),
+        "除外した行程グループ": ", ".join(dropped) or "(なし)",
+        "実装範囲": "実装順序 1〜2(素朴版 + マイルストーン位置合わせ) + 見積もりによる総量指定",
         "未使用パラメータ": f"k={ds.settings['k']}, タグ重み係数={ds.settings['タグ重み係数']} "
                             f"(実装順序 3・4 で使用予定)",
     }
 
     write_workbook(out, fc=fc, model=model, model_naive=model_naive, curves=curves,
                    ds=ds, detail=detail, monthly=monthly, summary=summary,
-                   params=params, warnings=warnings)
+                   params=params, warnings=warnings, actual_table=actual_table)
 
     print(f"出力: {out}")
     print(f"所要: {time.time() - t0:.1f} 秒")

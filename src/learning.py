@@ -116,7 +116,7 @@ def build_project_curves(ds, agg: pd.DataFrame, groups: list[str]) -> dict[str, 
     known = ds.known_ids
     hpm = float(ds.settings["人月換算係数"])
     curves: dict[str, ProjectCurve] = {}
-    skipped: dict[str, list[str]] = {"未登録": [], "期間不正": [], "実績ゼロ": []}
+    skipped: dict[str, list[str]] = {"未登録": [], "予測対象": [], "期間不正": [], "実績ゼロ": []}
     imputed: list[str] = []
     out_of_range: list[dict] = []
 
@@ -129,6 +129,14 @@ def build_project_curves(ds, agg: pd.DataFrame, groups: list[str]) -> dict[str, 
             continue
 
         prow = ds.project(pid)
+
+        # 予測対象の案件は進行中で実績が途中までしか無い。
+        # カーブは合計1に正規化してから平均するため、途中までの実績を混ぜると
+        # 「前半にすべて消化する案件」として学習され、平均カーブが前に倒れる。
+        # 自分自身を学習データにする情報漏れでもあるので、学習からは外す。
+        if str(prow.get("ステータス", "")) == "予測対象":
+            skipped["予測対象"].append(pid)
+            continue
         try:
             months = month_list(prow["開始"], prow["終了"])
             if not months:
@@ -228,6 +236,24 @@ def build_project_curves(ds, agg: pd.DataFrame, groups: list[str]) -> dict[str, 
             "学習に使える案件が1件もありません。"
             "実績の案件IDが projects シートの案件IDと一致しているか確認してください。")
     return curves
+
+
+def project_monthly(agg: pd.DataFrame, pid: str, months: list[str],
+                    groups: list[str]) -> pd.DataFrame:
+    """1案件の 月 × 行程グループ 実績表を作る(実績が無ければ空のDataFrame)。
+
+    予測対象が進行中の場合に「予測 vs 実績」を並べるために使う。
+    build_project_curves の中の pivot と同じ変換なので、
+    予測シートに出る実績と、学習が見ている実績は必ず一致する。
+    """
+    sub = agg[agg["案件ID"].astype(str) == str(pid)]
+    if sub.empty:
+        return pd.DataFrame()
+    piv = (sub.pivot_table(index="月", columns="行程グループ",
+                           values="時間", aggfunc="sum", observed=True)
+              .reindex(index=months, columns=groups).fillna(0.0))
+    piv.index = pd.Index(months, name="月")
+    return piv
 
 
 def _safe_float(v, default: float = float("nan")) -> float:

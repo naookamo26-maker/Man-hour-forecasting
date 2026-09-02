@@ -112,8 +112,10 @@ def _table(ws, row, df: pd.DataFrame, *, index_header: str | None = None,
 # ===========================================================================
 # 予測シート
 # ===========================================================================
-def _sheet_forecast(wb, fc, model, ds, cond_ref: str):
+def _sheet_forecast(wb, fc, model, ds, cond_ref: str, actual_table=None):
     ws = wb.create_sheet("予測")
+    # 予測した行程グループだけを扱う。この案件が行わない業務は列ごと落ちている。
+    fgroups = fc.groups
     r = 1
     r = _title(ws, r, f"工数予測  {fc.name}  ({fc.pid})")
     ws.cell(row=r, column=1, value="生成日時").font = BODY_FONT
@@ -155,10 +157,10 @@ def _sheet_forecast(wb, fc, model, ds, cond_ref: str):
     tbl.insert(0, "経過月", range(1, len(tbl) + 1))
     r_next, head, last = _table(
         ws, r, tbl, index_header="月",
-        num_fmt={g: "#,##0" for g in model.groups} | {"経過月": "0"},
-        col_width={"月": 10, "経過月": 8} | {g: 15 for g in model.groups})
+        num_fmt={g: "#,##0" for g in fgroups} | {"経過月": "0"},
+        col_width={"月": 10, "経過月": 8} | {g: 15 for g in fgroups})
 
-    n_g = len(model.groups)
+    n_g = len(fgroups)
     g_first = 3            # C列 = 最初の行程グループ
     g_last = g_first + n_g - 1
     tot_col = g_last + 1
@@ -200,7 +202,7 @@ def _sheet_forecast(wb, fc, model, ds, cond_ref: str):
     mm_head = r
     c = ws.cell(row=mm_head, column=1, value="月")
     c.fill, c.font, c.border = HEAD_FILL, HEAD_FONT, BOX
-    for j, g in enumerate(model.groups):
+    for j, g in enumerate(fgroups):
         c = ws.cell(row=mm_head, column=2 + j, value=g)
         c.fill, c.font, c.border = HEAD_FILL, HEAD_FONT, BOX
         c.alignment = Alignment(horizontal="center", wrap_text=True)
@@ -228,6 +230,90 @@ def _sheet_forecast(wb, fc, model, ds, cond_ref: str):
         c.font, c.border, c.number_format = Font(name=FONT, size=10, bold=True), BOX, "#,##0.0"
         c.fill = GOOD_FILL
     r = mm_last + 3
+
+    # --- 実績との比較 ---
+    # 予測対象が進行中なら、同じ月軸・同じ集計軸で実績を並べる。
+    # 予測だけを見ても、当たっているのか外れているのかは判断できない。
+    r = _title(ws, r, "■ 実績(時間)と 予測との比較", H2_FONT)
+    has_actual = actual_table is not None and not actual_table.empty \
+        and float(actual_table.to_numpy().sum()) > 0
+    if not has_actual:
+        r = _note(ws, r, "この案件の実績はまだ1行もありません。"
+                         "着手後に実績が入ると、ここに 月 × 行程グループ の実績と"
+                         "予測との差分が並びます。")
+        r += 1
+    else:
+        act = actual_table.reindex(index=fc.months, columns=fgroups).fillna(0.0).round(1)
+        r = _note(ws, r, "実績は予測と同じ集計(phase_map に載る行程・契約期間内)で作っている。"
+                         "実績が入っている月までが比較対象で、それ以降の実績は 0 と表示される。")
+        r += 1
+        # 上の予測表と列位置を揃える(経過月の分だけ行程グループが右へずれる)。
+        # 揃えておかないと合計式の参照範囲が1列ずれ、先頭グループが抜ける。
+        act.insert(0, "経過月", range(1, len(act) + 1))
+        r_next, ahead, alast = _table(
+            ws, r, act, index_header="月",
+            num_fmt={g: "#,##0" for g in fgroups} | {"経過月": "0"},
+            col_width={"月": 10, "経過月": 8} | {g: 15 for g in fgroups})
+        c = ws.cell(row=ahead, column=tot_col, value="合計")
+        c.fill, c.font, c.border = HEAD_FILL, HEAD_FONT, BOX
+        for rr in range(ahead + 1, alast + 1):
+            c = ws.cell(row=rr, column=tot_col,
+                        value=f"=SUM({get_column_letter(g_first)}{rr}:"
+                              f"{get_column_letter(g_last)}{rr})")
+            c.font, c.border, c.number_format = BODY_FONT, BOX, "#,##0"
+        a_sum = alast + 1
+        c = ws.cell(row=a_sum, column=1, value="合計")
+        c.font, c.border = Font(name=FONT, size=10, bold=True), BOX
+        for cc in range(g_first, tot_col + 1):
+            L = get_column_letter(cc)
+            c = ws.cell(row=a_sum, column=cc, value=f"=SUM({L}{ahead+1}:{L}{alast})")
+            c.font, c.border, c.number_format = Font(name=FONT, size=10, bold=True), BOX, "#,##0"
+            c.fill = GOOD_FILL
+        r = a_sum + 3
+
+        # --- 月次の 予測 vs 実績(差分は数式にして、どちらの表を直しても追従させる) ---
+        r = _title(ws, r, "■ 月次 予測 vs 実績(合計・時間)", H2_FONT)
+        d_head = r
+        TL = get_column_letter(tot_col)
+        for j, lab in enumerate(["月", "予測", "実績", "差分(予測-実績)", "消化率(実績/予測)"]):
+            c = ws.cell(row=d_head, column=1 + j, value=lab)
+            c.fill, c.font, c.border = HEAD_FILL, HEAD_FONT, BOX
+            c.alignment = Alignment(horizontal="center", wrap_text=True)
+            ws.column_dimensions[get_column_letter(1 + j)].width = max(12, len(lab) * 2)
+        for i in range(len(fc.months)):
+            rr = d_head + 1 + i
+            fsrc, asrc = hours_first + i, ahead + 1 + i
+            vals = [f"=A{fsrc}", f"={TL}{fsrc}", f"={TL}{asrc}",
+                    f"={TL}{fsrc}-{TL}{asrc}",
+                    f'=IF({TL}{fsrc}=0,"",{TL}{asrc}/{TL}{fsrc})']
+            for j, v in enumerate(vals):
+                c = ws.cell(row=rr, column=1 + j, value=v)
+                c.font, c.border = BODY_FONT, BOX
+                c.number_format = "0.0%" if j == 4 else ("#,##0" if j else "General")
+        d_last = d_head + len(fc.months)
+        c = ws.cell(row=d_last + 1, column=1, value="合計")
+        c.font, c.border = Font(name=FONT, size=10, bold=True), BOX
+        for j in range(1, 4):
+            L = get_column_letter(1 + j)
+            c = ws.cell(row=d_last + 1, column=1 + j,
+                        value=f"=SUM({L}{d_head+1}:{L}{d_last})")
+            c.font, c.border, c.number_format = Font(name=FONT, size=10, bold=True), BOX, "#,##0"
+            c.fill = GOOD_FILL
+        c = ws.cell(row=d_last + 1, column=5, value=f"=IF(B{d_last+1}=0,\"\",C{d_last+1}/B{d_last+1})")
+        c.font, c.border, c.number_format = Font(name=FONT, size=10, bold=True), BOX, "0.0%"
+        c.fill = GOOD_FILL
+
+        cmp_chart = LineChart()
+        cmp_chart.title = "月次工数 予測 vs 実績(時間)"
+        cmp_chart.y_axis.title, cmp_chart.x_axis.title = "時間", "月"
+        cmp_chart.height, cmp_chart.width = 9, min(30, 8 + 0.5 * len(fc.months))
+        cmp_chart.add_data(Reference(ws, min_col=2, max_col=3,
+                                     min_row=d_head, max_row=d_last), titles_from_data=True)
+        cmp_chart.set_categories(Reference(ws, min_col=1, min_row=d_head + 1, max_row=d_last))
+        for s in cmp_chart.series:
+            s.smooth = False
+        ws.add_chart(cmp_chart, f"G{d_head}")
+        r = d_last + 3
 
     # --- マイルストーン ---
     r = _title(ws, r, "■ マイルストーン(予測)", H2_FONT)
@@ -486,10 +572,11 @@ def _page_setup(ws):
 
 
 def write_workbook(path: str, *, fc, model, model_naive, curves, ds,
-                   detail, monthly, summary, params: dict, warnings: list[str]):
+                   detail, monthly, summary, params: dict, warnings: list[str],
+                   actual_table=None):
     wb = Workbook()
     wb.remove(wb.active)
-    _sheet_forecast(wb, fc, model, ds, "条件")
+    _sheet_forecast(wb, fc, model, ds, "条件", actual_table=actual_table)
     _sheet_curves(wb, model, model_naive, curves, ds)
     if not summary.empty:
         _sheet_validation(wb, detail, monthly, summary)

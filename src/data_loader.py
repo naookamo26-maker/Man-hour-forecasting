@@ -49,6 +49,9 @@ class Dataset:
     phase_map: pd.DataFrame    # 実績行程名 / 標準行程名 / 行程グループ / 大分類 (+任意の集約軸列)
     settings: dict             # パラメータ名 -> 値
     actuals: pd.DataFrame      # 案件ID / 行程 / メンバー / 所属 / チーム / 月 / 時間
+    estimates: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # 案件ID / 行程グループ / 見積人月。これから着手する案件は実績が1行も無く、
+    # 分かっているのは要素別の見積もりだけになる。その入力口(設計書 6 Step1)。
     source: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
     # 読み込み〜学習の途中で気づいた注意点をここに溜め、出力Excelの「条件」シートに載せる。
@@ -85,6 +88,29 @@ class Dataset:
 
     def milestones_of(self, pid: str) -> pd.DataFrame:
         return self.milestones[self.milestones["案件ID"] == pid].copy()
+
+    def estimates_of(self, pid: str) -> dict[str, float]:
+        """案件の 行程グループ -> 見積時間。未入力なら空の辞書。
+
+        見積もりが1行でもあれば、そこに現れない行程グループは
+        「この案件では行わない業務」として予測から外す(設計書 6 Step1)。
+        """
+        if self.estimates.empty:
+            return {}
+        sub = self.estimates[self.estimates["案件ID"].astype(str) == str(pid)]
+        if sub.empty:
+            return {}
+        hpm = self.hours_per_mm
+        out: dict[str, float] = {}
+        for _, r in sub.iterrows():
+            g = str(r["行程グループ"]).strip()
+            try:
+                mm = float(r["見積人月"])
+            except (TypeError, ValueError):
+                continue
+            if g and mm > 0:
+                out[g] = out.get(g, 0.0) + mm * hpm
+        return out
 
     def tags_of(self, pid: str) -> list[str]:
         raw = self.project(pid).get("タグ", "")
@@ -160,6 +186,22 @@ def load_all(master_path: str, actuals_path: str,
         # マイルストーンシートが無くても動く(設計書 3-2)
         milestones = pd.DataFrame(columns=["案件ID", "マイルストーン名", "日付"])
 
+    try:
+        estimates = _read_table(master_path, "estimates")
+        need = ["案件ID", "行程グループ", "見積人月"]
+        missing = [c for c in need if c not in estimates.columns]
+        if missing:
+            raise ValueError(f"estimates シートに必須列がありません: {missing}")
+        estimates["案件ID"] = estimates["案件ID"].astype(str).str.strip()
+        estimates["行程グループ"] = estimates["行程グループ"].astype(str).str.strip()
+        estimates["見積人月"] = pd.to_numeric(estimates["見積人月"], errors="coerce")
+    except ValueError as e:
+        # estimates シートが無くても動く。着手前の案件に見積もりが無い段階では
+        # 契約人月 + 学習した工数比率だけで予測する(設計書 6 Step1 の第1階層)。
+        if "estimates シートに必須列がありません" in str(e):
+            raise
+        estimates = pd.DataFrame(columns=["案件ID", "行程グループ", "見積人月"])
+
     phase_map = _read_table(master_path, "phase_map")
     for c in phase_map.columns:
         phase_map[c] = phase_map[c].astype(str).str.strip()
@@ -179,6 +221,7 @@ def load_all(master_path: str, actuals_path: str,
         phase_map=phase_map,
         settings=settings,
         actuals=actuals,
+        estimates=estimates,
         source={"master": os.path.abspath(master_path),
                 "actuals": os.path.abspath(actuals_path)},
     )
