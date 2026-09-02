@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -20,7 +21,7 @@ import pandas as pd
 # 実績CSVのパース仕様を変えたらここを上げる。
 # キャッシュキーに含めることで、ロジック変更後に古い(バグ入り)パース結果の
 # parquetキャッシュを誤って使い続けるのを防ぐ。
-CACHE_SCHEMA_VERSION = "v2"
+CACHE_SCHEMA_VERSION = "v3"
 
 # 全角の数字・小数点・桁区切りを半角に変換してから数値パースする。
 _ZEN_DIGITS = str.maketrans("０１２３４５６７８９．，", "0123456789.,")
@@ -214,6 +215,75 @@ def _to_month_str(v) -> str:
     return pd.Period(pd.Timestamp(v), freq="M").strftime("%Y-%m")
 
 
+_MONTH_SEP = re.compile(r"^(\d{4})\D(\d{1,2})(?:\D.*)?$")   # 2019-4 / 2019/04 / 2019-04-01
+_MONTH_FLAT = re.compile(r"^(\d{4})(\d{2})(?:\d{2})?$")      # 201904 / 20190401
+
+
+def _to_month_key(v: str) -> str | None:
+    """実績側の年月表記を 'YYYY-MM' に正規化する。解釈できなければ None。
+
+    受け付ける表記: 2019-4 / 2019-04 / 2019/4 / 2019.4 / 2019-04-01 / 201904 …
+    """
+    t = v.translate(_ZEN_DIGITS).strip()
+    if not t:
+        return None
+    m = _MONTH_SEP.match(t) or _MONTH_FLAT.match(t)
+    if not m:
+        return None
+    year, month = int(m.group(1)), int(m.group(2))
+    if not 1 <= month <= 12:
+        return None
+    return f"{year:04d}-{month:02d}"
+
+
+def _normalize_months(raw: pd.Series) -> tuple[pd.Series, dict | None, dict | None]:
+    """「月」列を 'YYYY-MM' に揃える。
+
+    ここを素通しにすると被害が大きい。案件の月リストは
+    pd.period_range から作られるため常にゼロ埋めの 'YYYY-MM' だが、
+    実績側が '2019-4' のようにゼロ埋めされていないと文字列として一致せず、
+    build_project_curves の reindex で丸ごと落ちる。
+    しかも文字列比較では '2019-4' > '2019-04' となるため、
+    期間内のはずの実績が「契約期間外(終了後)」として除外され、
+    警告を読んでも真因が年月の桁揃えだとはわからない。
+    1〜9月がすべてこれに該当するので、実績の7〜8割が消えることもある。
+
+    月の異なり数はたかだか数百なので、ユニーク値だけ変換して貼り直す。
+    80万行でも一瞬で終わる。
+
+    戻り値: (正規化後の月, 表記ゆれの情報, 解釈不能の情報)
+    """
+    s = raw.fillna("").astype(str).str.strip()
+    uniq = s.unique()
+
+    mapping, bad, reformatted = {}, [], []
+    for v in uniq:
+        key = _to_month_key(v)
+        if key is None:
+            mapping[v] = v          # 解釈できない値は原文のまま残し、警告で報告する
+            if v:
+                bad.append(v)
+            continue
+        mapping[v] = key
+        if key != v:
+            reformatted.append((v, key))
+
+    out = s.map(mapping)
+
+    fixed_info = None
+    if reformatted:
+        n = int(s.isin([v for v, _ in reformatted]).sum())
+        shown = ", ".join(f"{v!r}→{k!r}" for v, k in reformatted[:3])
+        fixed_info = {"count": n, "examples": shown}
+
+    bad_info = None
+    if bad:
+        n = int(s.isin(bad).sum())
+        bad_info = {"count": n, "examples": ", ".join(repr(v) for v in bad[:5])}
+
+    return out, fixed_info, bad_info
+
+
 def _parse_hours(raw: pd.Series) -> tuple[pd.Series, dict | None]:
     """「時間」列を数値に変換する。
 
@@ -284,9 +354,25 @@ def _read_actuals(path: str, use_cache: bool = True) -> tuple[pd.DataFrame, list
     for c in ("案件ID", "行程", "メンバー", "所属", "チーム", "月"):
         df[c] = df[c].str.strip()
 
+    warnings = []
+
+    df["月"], fixed_months, bad_months = _normalize_months(df["月"])
+    if fixed_months:
+        warnings.append(
+            f"実績データの「月」列が 'YYYY-MM' で揃っていない行が {fixed_months['count']:,} 行あり、"
+            f"正規化しました(例: {fixed_months['examples']})。"
+            "正規化しないと案件の月リストと文字列一致せず、期間内の実績が"
+            "「契約期間外」として除外される。出力側の表記を揃えることが望ましい。"
+        )
+    if bad_months:
+        warnings.append(
+            f"実績データの「月」列に年月として解釈できない値が {bad_months['count']:,} 行あり、"
+            f"どの月にも割り当てられませんでした。例: {bad_months['examples']} 。"
+            "この分は集計から丸ごと漏れる。"
+        )
+
     df["時間"], bad = _parse_hours(df["時間"])
 
-    warnings = []
     if bad:
         shown = ", ".join(repr(v) for v in bad["examples"])
         warnings.append(
