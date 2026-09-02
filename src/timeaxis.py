@@ -123,19 +123,99 @@ class Warp:
 # ---------------------------------------------------------------------------
 FINE_N = 4000  # 移送に使う細分グリッドの点数
 
+RECON_BOX = "月内均等"      # 従来方式
+RECON_SMOOTH = "単調補間"   # 累積を単調補間して微分する方式
+RECON_MODES = (RECON_BOX, RECON_SMOOTH)
+
+
+def _pchip_tangents(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """単調保存の3次補間(Fritsch-Carlson)の各節点における傾き。
+
+    scipy.interpolate.PchipInterpolator と同じ式。
+    scipyを依存に加えないため、必要な部分だけ numpy で持つ。
+    """
+    h = np.diff(x)
+    delta = np.diff(y) / h
+    d = np.zeros_like(y, dtype=float)
+
+    if len(x) == 2:
+        d[:] = delta[0]
+        return d
+
+    # 内部の節点: 隣り合う傾きの符号が違えば 0(=行き過ぎを作らない)、
+    # 同符号なら区間長で重み付けした調和平均。
+    m0, m1 = delta[:-1], delta[1:]
+    h0, h1 = h[:-1], h[1:]
+    same = np.sign(m0) * np.sign(m1) > 0
+    w1, w2 = 2 * h1 + h0, h1 + 2 * h0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        harmonic = (w1 + w2) / (w1 / np.where(m0 == 0, np.nan, m0)
+                                + w2 / np.where(m1 == 0, np.nan, m1))
+    d[1:-1] = np.where(same, np.nan_to_num(harmonic), 0.0)
+
+    # 端点は片側3点式。母数の傾きと符号が違えば 0、行き過ぎなら 3倍で頭打ち。
+    def _edge(h0_, h1_, m0_, m1_):
+        v = ((2 * h0_ + h1_) * m0_ - h0_ * m1_) / (h0_ + h1_)
+        if np.sign(v) != np.sign(m0_):
+            return 0.0
+        if np.sign(m0_) != np.sign(m1_) and abs(v) > 3 * abs(m0_):
+            return 3 * m0_
+        return float(v)
+
+    d[0] = _edge(h[0], h[1], delta[0], delta[1])
+    d[-1] = _edge(h[-1], h[-2], delta[-1], delta[-2])
+    return d
+
+
+def _pchip_eval(x: np.ndarray, y: np.ndarray, xi: np.ndarray) -> np.ndarray:
+    """単調保存3次補間の評価。x は昇順、xi は x の範囲内。"""
+    d = _pchip_tangents(x, y)
+    k = np.clip(np.searchsorted(x, xi, side="right") - 1, 0, len(x) - 2)
+    h = (x[k + 1] - x[k])
+    t = (xi - x[k]) / h
+    t2, t3 = t * t, t * t * t
+    # エルミート基底
+    h00 = 2 * t3 - 3 * t2 + 1
+    h10 = t3 - 2 * t2 + t
+    h01 = -2 * t3 + 3 * t2
+    h11 = t3 - t2
+    return h00 * y[k] + h10 * h * d[k] + h01 * y[k + 1] + h11 * h * d[k + 1]
+
 
 def monthly_to_canonical(monthly: np.ndarray, edges: np.ndarray,
-                         warp: Warp, n_bin: int) -> np.ndarray:
+                         warp: Warp, n_bin: int,
+                         recon: str = RECON_BOX) -> np.ndarray:
     """月次工数(実時間軸)を正準時間軸のビンに移送する。
 
-    細かいグリッド上に工数を薄く撒き、各点をワープで正準軸へ写して数え直す。
-    合計値は厳密に保存される。
+    recon が決めるのは「月次の値から、月の内側の分布をどう復元するか」。
+
+      月内均等  月次工数を月の中に一様に撒く。実装は素直だが、
+                幅 1/月数 の箱型ぼかしを全案件に掛けるのと等価で、
+                期間の短い案件ほど山がなまる(4ヶ月案件は真の山の約5割)。
+      単調補間  月境界での累積値だけは厳密に既知であることを使う。
+                累積を単調保存3次補間し、正準ビンの境界での差をとる。
+                月内均等の仮定を外すぶん山が保たれ、長期案件でも改善する。
+
+    どちらも合計値は厳密に保存される。
     """
+    monthly = np.asarray(monthly, dtype=float)
+    if recon == RECON_SMOOTH and len(monthly) >= 3:
+        total = float(monthly.sum())
+        if total <= 0:
+            return np.zeros(n_bin)
+        cum = np.concatenate([[0.0], np.cumsum(monthly)])
+        s_edges = np.linspace(0.0, 1.0, n_bin + 1)
+        u_edges = warp.to_actual(s_edges)          # 正準ビンの境界を実時間軸へ戻す
+        out = np.diff(_pchip_eval(np.asarray(edges, dtype=float), cum, u_edges))
+        out = np.clip(out, 0.0, None)
+        s = out.sum()
+        return out * (total / s) if s > 0 else np.zeros(n_bin)
+
     fine_u = (np.arange(FINE_N) + 0.5) / FINE_N
     m_idx = np.clip(np.searchsorted(edges, fine_u, side="right") - 1, 0, len(monthly) - 1)
     counts = np.bincount(m_idx, minlength=len(monthly)).astype(float)
     counts[counts == 0] = 1.0
-    mass = np.asarray(monthly, dtype=float)[m_idx] / counts[m_idx]
+    mass = monthly[m_idx] / counts[m_idx]
 
     s = warp.to_canonical(fine_u)
     c_idx = np.clip((s * n_bin).astype(int), 0, n_bin - 1)

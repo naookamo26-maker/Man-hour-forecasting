@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .timeaxis import (Warp, date_to_t, month_edges, month_list,
+from .timeaxis import (RECON_BOX, Warp, date_to_t, month_edges, month_list,
                        monthly_to_canonical, t_to_date)
 
 
@@ -318,6 +318,7 @@ class Model:
     align: bool
     project_shapes: dict[str, np.ndarray] = field(default_factory=dict)  # カーブシート用
     hours_per_mm: float = 160.0
+    recon: str = RECON_BOX     # 月次から月内分布を復元する方式
     group_sample_n: dict[str, int] = field(default_factory=dict)
     # 行程グループ -> その形状カーブの学習に参加した案件数。
     # そのグループの業務が一切ない案件は形状の平均に参加しないため、
@@ -355,7 +356,8 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
           align: bool = True, n_bin: int = 100, backbone_spec: str = "自動",
           backbone_coverage: float = 0.6,
           weights: dict[str, float] | None = None,
-          hours_per_mm: float = 160.0) -> Model:
+          hours_per_mm: float = 160.0,
+          recon: str = RECON_BOX) -> Model:
     """案件カーブ群から予測モデルを学習する。
 
     align=False なら素朴版(経過期間比のまま単純平均)、
@@ -402,7 +404,7 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
             monthly = c.monthly[g].to_numpy()
             if monthly.sum() <= 0:
                 continue  # その案件に存在しないグループは平均に参加しない
-            can = monthly_to_canonical(monthly, c.edges, c.warp, n_bin)
+            can = monthly_to_canonical(monthly, c.edges, c.warp, n_bin, recon=recon)
             can = can / can.sum()          # 案件規模で重み付けしないよう正規化
             w = weights.get(pid, 1.0)
             acc += can * w
@@ -417,7 +419,7 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
     project_shapes = {}
     for pid, c in curves.items():
         tot = c.monthly.sum(axis=1).to_numpy()
-        can = monthly_to_canonical(tot, c.edges, c.warp, n_bin)
+        can = monthly_to_canonical(tot, c.edges, c.warp, n_bin, recon=recon)
         project_shapes[pid] = can / can.sum()
 
     # --- Step 5: マイルストーン位置分布 ---
@@ -457,7 +459,8 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
     return Model(groups=groups, n_bin=n_bin, shape=shape, group_ratio=group_ratio,
                  ms_stats=ms_stats, backbone=backbone, canonical_anchor=canonical_anchor,
                  contributors=contributors, align=align, project_shapes=project_shapes,
-                 hours_per_mm=hours_per_mm, group_sample_n=group_sample_n)
+                 hours_per_mm=hours_per_mm, group_sample_n=group_sample_n,
+                 recon=recon)
 
 
 def group_names(agg: pd.DataFrame, phase_map: pd.DataFrame, group_col: str) -> list[str]:

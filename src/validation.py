@@ -25,6 +25,7 @@ import pandas as pd
 
 from .forecast import forecast
 from .learning import ProjectCurve, learn
+from .timeaxis import RECON_BOX, RECON_SMOOTH
 
 MODES = [
     ("素朴版", False, False),
@@ -62,8 +63,13 @@ def _metrics(pred: pd.DataFrame, act: pd.DataFrame) -> dict:
 def leave_one_out(ds, curves: dict[str, ProjectCurve], groups: list[str], *,
                   n_bin: int = 100, backbone_spec: str = "自動",
                   backbone_coverage: float = 0.6, hours_per_mm: float = 160.0,
-                  modes=MODES) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                  modes=MODES,
+                  recons=(RECON_BOX,)) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """leave-one-out を実行する。
+
+    recons に復元方式を複数渡すと、同じ案件・同じモードで方式を並べて比較できる。
+    月内均等 と 単調補間 のどちらが実データで効くかは案件の期間構成で変わるため、
+    採用する前に必ずこの数字で確かめること。
 
     戻り値: (案件別の誤差, 月次の予測vs実績, モード別サマリ)
     """
@@ -73,16 +79,19 @@ def leave_one_out(ds, curves: dict[str, ProjectCurve], groups: list[str], *,
     if len(pids) < 2:
         raise ValueError("leave-one-out には最低2案件の実績が必要です。")
 
+    combos = [(f"{lab}／{rc}" if len(recons) > 1 else lab, al, ug, rc)
+              for rc in recons for lab, al, ug in modes]
+
     for held in pids:
         rest = {p: c for p, c in curves.items() if p != held}
         act = curves[held].monthly
         act_total = float(act.to_numpy().sum())
 
-        for label, align, use_given in modes:
+        for label, align, use_given, recon in combos:
             model = learn(rest, groups, align=align, n_bin=n_bin,
                           backbone_spec=backbone_spec,
                           backbone_coverage=backbone_coverage,
-                          hours_per_mm=hours_per_mm)
+                          hours_per_mm=hours_per_mm, recon=recon)
             fc = forecast(model, ds, held, use_given_milestones=use_given,
                           months_override=curves[held].months)
 
@@ -93,6 +102,7 @@ def leave_one_out(ds, curves: dict[str, ProjectCurve], groups: list[str], *,
             detail_rows.append({
                 "案件ID": held, "名称": curves[held].name,
                 "種別": curves[held].ptype, "モード": label,
+                "復元方式": recon,
                 "契約人月": curves[held].contract_mm,
                 "期間(月)": len(curves[held].months),
                 "学習件数": len(rest),
@@ -115,7 +125,7 @@ def leave_one_out(ds, curves: dict[str, ProjectCurve], groups: list[str], *,
     detail = pd.DataFrame(detail_rows)
     monthly = pd.DataFrame(monthly_rows)
 
-    order = [m[0] for m in modes]
+    order = [c[0] for c in combos]
     summary = (detail.groupby("モード", observed=True)
                .agg(**{
                    "案件数": ("案件ID", "count"),

@@ -26,6 +26,7 @@ from src.excel_writer import write_workbook
 from src.forecast import forecast
 from src.learning import (aggregate_actuals, build_project_curves, group_names,
                           learn, project_monthly)
+from src.timeaxis import RECON_BOX, RECON_MODES, RECON_SMOOTH
 from src.validation import leave_one_out
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -53,6 +54,11 @@ def parse_args(argv=None):
                         "estimates シートに見積もりがある場合は、そちらが優先される")
     p.add_argument("--ignore-estimates", action="store_true",
                    help="estimates シートの見積もりを使わず、契約人月と学習比率だけで予測する")
+    p.add_argument("--reconstruct", choices=["box", "smooth"], default=None,
+                   help="月次から月内分布を復元する方式。box=月内均等(既定) / "
+                        "smooth=累積の単調補間。省略時は settings の カーブ復元")
+    p.add_argument("--no-compare-recon", action="store_true",
+                   help="検証で復元方式を比較しない(既定は両方式を並べて出す)")
     p.add_argument("--out", default=None, help="出力Excelのパス")
     p.add_argument("--no-validate", action="store_true", help="leave-one-out を実行しない")
     p.add_argument("--no-cache", action="store_true", help="実績のparquetキャッシュを使わない")
@@ -84,6 +90,8 @@ def _run(argv=None) -> int:
         overrides["背骨マイルストーン"] = a.backbone
     if a.backbone_coverage is not None:
         overrides["背骨最小カバー率"] = a.backbone_coverage
+    if a.reconstruct:
+        overrides["カーブ復元"] = RECON_BOX if a.reconstruct == "box" else RECON_SMOOTH
 
     print("=" * 72)
     print("工数予測システム(第1版:素朴版 + マイルストーン位置合わせ)")
@@ -95,6 +103,9 @@ def _run(argv=None) -> int:
     n_bin = int(ds.settings["カーブ解像度"])
     backbone_spec = str(ds.settings["背骨マイルストーン"])
     coverage = float(ds.settings["背骨最小カバー率"])
+    recon = str(ds.settings["カーブ復元"])
+    if recon not in RECON_MODES:
+        raise ValueError(f"カーブ復元 は {' / '.join(RECON_MODES)} のいずれか(指定値: {recon!r})")
     hpm = ds.hours_per_mm
 
     print(f"[1/5] 読み込み  案件 {len(ds.projects)} 件 / 実績 {len(ds.actuals):,} 行 "
@@ -112,11 +123,12 @@ def _run(argv=None) -> int:
     # --- 学習 ---
     model = learn(curves, groups, align=align, n_bin=n_bin,
                   backbone_spec=backbone_spec, backbone_coverage=coverage,
-                  hours_per_mm=hpm)
-    model_naive = (learn(curves, groups, align=False, n_bin=n_bin, hours_per_mm=hpm)
+                  hours_per_mm=hpm, recon=recon)
+    model_naive = (learn(curves, groups, align=False, n_bin=n_bin, hours_per_mm=hpm,
+                         recon=recon)
                    if align else None)
     print(f"[3/5] 学習      位置合わせ {'ON' if align else 'OFF'} / "
-          f"背骨: {', '.join(model.backbone) or '(なし)'}")
+          f"背骨: {', '.join(model.backbone) or '(なし)'} / カーブ復元: {recon}")
     if not model.backbone and align:
         print("                マイルストーンが不足のため素朴版と同じ挙動になります。")
 
@@ -188,9 +200,10 @@ def _run(argv=None) -> int:
         detail = monthly = summary = pd.DataFrame()
         print("[5/5] 検証      スキップ")
     else:
+        recons = (recon,) if a.no_compare_recon else RECON_MODES
         detail, monthly, summary = leave_one_out(
             ds, curves, groups, n_bin=n_bin, backbone_spec=backbone_spec,
-            backbone_coverage=coverage, hours_per_mm=hpm)
+            backbone_coverage=coverage, hours_per_mm=hpm, recons=recons)
         print("[5/5] 検証      leave-one-out 完了")
         print()
         for _, r in summary.iterrows():
@@ -215,6 +228,7 @@ def _run(argv=None) -> int:
         "位置合わせ": "ON" if align else "OFF",
         "背骨マイルストーン": ", ".join(model.backbone) or "(なし)",
         "背骨最小カバー率": coverage,
+        "カーブ復元": recon,
         "カーブ解像度": n_bin,
         "人月換算係数": hpm,
         "学習案件数": len(curves),

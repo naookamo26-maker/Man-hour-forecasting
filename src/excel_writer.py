@@ -404,6 +404,38 @@ def _sheet_curves(wb, model, model_naive, curves, ds):
 
     r = r_next + 22
 
+    # --- 案件別の密度(非累積) ---
+    # 累積カーブは単調増加なので、どの案件も似たS字に見えて差が読み取りにくい。
+    # 山がどこに立つか、いくつあるか、どれだけ鋭いかは非累積で初めて見える。
+    r = _title(ws, r, "■ 工数密度(非累積):平均カーブ vs 各案件", H2_FONT)
+    r = _note(ws, r, "上の累積カーブと同じデータを、累積せずに density として並べたもの。"
+                     "面積が1になるよう正規化しているので、案件規模によらず形だけを比べられる。"
+                     "山の位置・鋭さ・数の違いはこちらでしか見えない。")
+    r += 1
+    dens_p = {"平均(位置合わせあり)": model.total_shape * n}
+    if model_naive is not None:
+        dens_p["平均(位置合わせなし)"] = model_naive.total_shape * n
+    for pid in sorted(model.project_shapes):
+        dens_p[pid] = model.project_shapes[pid] * n
+    dfd = pd.DataFrame(dens_p, index=np.round(t, 4))
+    dfd.index.name = "t"
+    r_next, headd, lastd = _table(ws, r, dfd, index_header="t",
+                                  num_fmt={c: "0.000" for c in dfd.columns},
+                                  col_width={"t": 8} | {c: 13 for c in dfd.columns})
+    lnd = LineChart()
+    lnd.title = "工数密度カーブ(非累積・太線=平均)"
+    lnd.y_axis.title, lnd.x_axis.title = "密度", "正準時間軸 t"
+    lnd.height, lnd.width = 11, 24
+    lnd.add_data(Reference(ws, min_col=2, max_col=1 + len(dfd.columns),
+                           min_row=headd, max_row=lastd), titles_from_data=True)
+    lnd.set_categories(Reference(ws, min_col=1, min_row=headd + 1, max_row=lastd))
+    for s in lnd.series:
+        s.marker.symbol = "none"
+        s.smooth = False
+    ws.add_chart(lnd, f"{get_column_letter(len(dfd.columns) + 3)}{headd}")
+
+    r = r_next + 22
+
     # --- 行程グループ別の密度 ---
     r = _title(ws, r, "■ 行程グループ別 平均カーブ(密度・面積1)", H2_FONT)
     r = _note(ws, r, "各行程グループが正準時間軸のどこで消化されるか。"
@@ -505,7 +537,7 @@ def _sheet_validation(wb, detail, monthly, summary):
 # ===========================================================================
 # 条件シート
 # ===========================================================================
-def _sheet_conditions(wb, model, ds, fc, params: dict, warnings: list[str]):
+def _sheet_conditions(wb, model, ds, fc, params: dict, warnings: list[str], curves):
     ws = wb.create_sheet("条件")
     r = 1
     r = _title(ws, r, "実行条件")
@@ -534,6 +566,41 @@ def _sheet_conditions(wb, model, ds, fc, params: dict, warnings: list[str]):
     r, _, _ = _table(ws, r, model.contributors,
                      num_fmt={"重み": "0.00", "契約人月": "#,##0", "実績人月": "#,##0"},
                      col_width={"案件ID": 13, "名称": 28, "種別": 18})
+
+    # 上の表の「実績人月」を行程グループへ分解したもの。
+    # 学習された工数比率がどの案件のどの業務から来ているかを、ここで追える。
+    r = _title(ws, r, "■ 案件別 × 行程グループ 実績工数(人月)", H2_FONT)
+    r = _note(ws, r, "予測と同じ集計(phase_map に載る行程・契約期間内)での実績合計。"
+                     "0 はその案件がその業務を行っていないことを示す。"
+                     "最下行は全案件の合計で、その構成比が学習値そのものではない点に注意"
+                     "(学習は案件ごとの構成比を平均するため、規模の大きい案件に引っ張られない)。")
+    r += 1
+    rows = []
+    for pid, c in sorted(curves.items()):
+        s = c.monthly.sum(axis=0).reindex(model.groups).fillna(0.0) / model.hours_per_mm
+        row = {"案件ID": pid, "名称": c.name, "期間(月)": len(c.months)}
+        row.update({g: round(float(s[g]), 1) for g in model.groups})
+        row["合計"] = round(float(s.sum()), 1)
+        rows.append(row)
+    if rows:
+        gdf_p = pd.DataFrame(rows)
+        total_row = {"案件ID": "合計", "名称": "", "期間(月)": None}
+        total_row.update({g: round(float(gdf_p[g].sum()), 1) for g in model.groups})
+        total_row["合計"] = round(float(gdf_p["合計"].sum()), 1)
+        share_row = {"案件ID": "構成比", "名称": "(全案件の単純合計)", "期間(月)": None}
+        tot = total_row["合計"] or 1.0
+        share_row.update({g: round(total_row[g] / tot, 4) for g in model.groups})
+        share_row["合計"] = 1.0
+        gdf_p = pd.concat([gdf_p, pd.DataFrame([total_row, share_row])], ignore_index=True)
+        r, ghead, glast = _table(ws, r, gdf_p,
+                                 num_fmt={g: "#,##0.0" for g in model.groups} | {"合計": "#,##0.0"},
+                                 col_width={"案件ID": 13, "名称": 26, "期間(月)": 9}
+                                 | {g: 15 for g in model.groups})
+        # 最終行(構成比)だけは比率なので、列単位の書式を上書きして%表示にする。
+        for cc in range(4, 4 + len(model.groups) + 1):
+            cell = ws.cell(row=glast, column=cc)
+            cell.number_format = "0.0%"
+            cell.font = NOTE_FONT
 
     r = _title(ws, r, "■ マイルストーン位置分布(学習値)", H2_FONT)
     r, _, _ = _table(ws, r, model.ms_stats,
@@ -580,7 +647,7 @@ def write_workbook(path: str, *, fc, model, model_naive, curves, ds,
     _sheet_curves(wb, model, model_naive, curves, ds)
     if not summary.empty:
         _sheet_validation(wb, detail, monthly, summary)
-    _sheet_conditions(wb, model, ds, fc, params, warnings)
+    _sheet_conditions(wb, model, ds, fc, params, warnings, curves)
     for ws in wb.worksheets:
         _page_setup(ws)
     wb.save(path)
