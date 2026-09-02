@@ -168,6 +168,9 @@ def load_all(master_path: str, actuals_path: str,
     if overrides:
         settings.update({k: v for k, v in overrides.items() if v is not None})
 
+    # 集約軸は settings と overrides の両方で決まるため、確定した後に検証する。
+    phase_map, phase_map_warnings = _check_phase_map(phase_map, str(settings["集約軸"]))
+
     actuals, actuals_warnings = _read_actuals(actuals_path, use_cache=use_cache)
 
     ds = Dataset(
@@ -179,9 +182,54 @@ def load_all(master_path: str, actuals_path: str,
         source={"master": os.path.abspath(master_path),
                 "actuals": os.path.abspath(actuals_path)},
     )
+    ds.warnings.extend(phase_map_warnings)
     ds.warnings.extend(actuals_warnings)
     _check_consistency(ds)
     return ds
+
+
+def _check_phase_map(phase_map: pd.DataFrame, group_col: str) -> tuple[pd.DataFrame, list[str]]:
+    """phase_map の不備を取り除き、警告として返す。
+
+    ある行程を集計するか否か、するならどのグループに入れるかは、
+    この表だけが判断材料になっている。ここが静かに壊れると、
+    実績CSVが正しくても集計対象そのものがずれる。
+
+    見ているのは2点。
+      1. 集約軸の値が空欄の行。groups 一覧に欠損が紛れ、出力に中身のない
+         列が生える。さらにその行程は「phase_map に無い行程」として
+         除外されるため、行を足したのに集計されないという状態になる。
+      2. 実績行程名の重複。マッピングは dict(zip(...)) で作るため後勝ちになり、
+         先に書いた割り当てが黙って捨てられる。工数は消えないが
+         別グループに付け替わるので、工数比率だけが静かに歪む。
+    """
+    warnings: list[str] = []
+    if group_col not in phase_map.columns or "実績行程名" not in phase_map.columns:
+        return phase_map, warnings      # 列自体が無い場合は aggregate_actuals が止める
+
+    blank = phase_map[group_col].isna() | (phase_map[group_col].astype(str).str.strip() == "")
+    if blank.any():
+        names = phase_map.loc[blank, "実績行程名"].astype(str).tolist()
+        shown = ", ".join(names[:8]) + (" ほか" if len(names) > 8 else "")
+        warnings.append(
+            f"phase_map の「{group_col}」が空欄の行が {int(blank.sum())} 行あり、無視しました: {shown}。"
+            "この行程は集計対象になりません。集計したい場合は行程グループを入力すること。")
+        phase_map = phase_map.loc[~blank].reset_index(drop=True)
+
+    dup = phase_map["実績行程名"].duplicated(keep=False)
+    if dup.any():
+        conflict = [nm for nm, sub in phase_map[dup].groupby("実績行程名", observed=True)
+                    if sub[group_col].nunique() > 1]
+        for nm in conflict[:8]:
+            hit = phase_map.loc[phase_map["実績行程名"] == nm, group_col].astype(str).tolist()
+            warnings.append(
+                f"phase_map で行程「{nm}」が複数の{group_col}に登録されています({' / '.join(hit)})。"
+                f"最後の「{hit[-1]}」だけが使われ、他は無視されます。"
+                "この行程の工数はすべてそのグループに集計されるため、工数比率が意図とずれる。")
+        if len(conflict) > 8:
+            warnings.append(f"  ほか {len(conflict) - 8} 行程が重複登録されています。")
+
+    return phase_map, warnings
 
 
 def _check_consistency(ds: Dataset) -> None:
