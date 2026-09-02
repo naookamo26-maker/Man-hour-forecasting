@@ -292,6 +292,10 @@ class Model:
     align: bool
     project_shapes: dict[str, np.ndarray] = field(default_factory=dict)  # カーブシート用
     hours_per_mm: float = 160.0
+    group_sample_n: dict[str, int] = field(default_factory=dict)
+    # 行程グループ -> その形状カーブの学習に参加した案件数。
+    # そのグループの業務が一切ない案件は形状の平均に参加しないため、
+    # グループごとに実際のサンプル数が違う。カーブの信頼度はここでしか分からない。
 
     @property
     def total_shape(self) -> np.ndarray:
@@ -306,6 +310,16 @@ class Model:
 
     def low_sample_milestones(self, min_n: int) -> list[str]:
         return self.ms_stats.loc[self.ms_stats["件数"] < min_n, "マイルストーン名"].tolist()
+
+    def low_sample_groups(self, min_n: int) -> list[str]:
+        """形状カーブが少数の案件からしか学習できていない行程グループ。
+
+        比率が 0 のグループ(どの案件にも実績が無い)は予測に一切配分されず、
+        誤った数字が出るわけではないので対象外とする。
+        """
+        return [g for g in self.groups
+                if 0 < self.group_sample_n.get(g, 0) < min_n
+                and self.group_ratio.get(g, 0.0) > 0]
 
 
 # ===========================================================================
@@ -353,9 +367,11 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
 
     # --- 形状の平均(位置合わせ済みの正準軸上で) ---
     shape: dict[str, np.ndarray] = {}
+    group_sample_n: dict[str, int] = {}
     for g in groups:
         acc = np.zeros(n_bin)
         wsum = 0.0
+        n_used = 0
         for pid, c in curves.items():
             monthly = c.monthly[g].to_numpy()
             if monthly.sum() <= 0:
@@ -365,7 +381,11 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
             w = weights.get(pid, 1.0)
             acc += can * w
             wsum += w
+            n_used += 1
+        # 全案件に無いグループは一様分布で埋める。比率も0になるため予測には
+        # 配分されないが、見積もり分類で総量を指定された場合の受け皿になる。
         shape[g] = acc / wsum if wsum > 0 else np.full(n_bin, 1.0 / n_bin)
+        group_sample_n[g] = n_used
 
     # --- カーブシート用: 案件ごとの総工数形状(正準軸) ---
     project_shapes = {}
@@ -411,7 +431,7 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
     return Model(groups=groups, n_bin=n_bin, shape=shape, group_ratio=group_ratio,
                  ms_stats=ms_stats, backbone=backbone, canonical_anchor=canonical_anchor,
                  contributors=contributors, align=align, project_shapes=project_shapes,
-                 hours_per_mm=hours_per_mm)
+                 hours_per_mm=hours_per_mm, group_sample_n=group_sample_n)
 
 
 def group_names(agg: pd.DataFrame, phase_map: pd.DataFrame, group_col: str) -> list[str]:

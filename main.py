@@ -121,6 +121,18 @@ def _run(argv=None) -> int:
     for nm in model.low_sample_milestones(min_n):
         n = int(model.ms_stats.loc[model.ms_stats["マイルストーン名"] == nm, "件数"].iloc[0])
         warnings.append(f"マイルストーン「{nm}」は n={n} 件のみ。参考値として扱うこと(閾値 {min_n})。")
+    # 行程グループの形状カーブは、そのグループの業務がある案件だけで平均される。
+    # 一部の案件にしか無い業務は少数サンプルのカーブになるが、出力上は
+    # 全案件から学習したカーブと見分けがつかないため、件数を明示する。
+    min_g = int(ds.settings["行程グループ最小件数"])
+    for g in model.low_sample_groups(min_g):
+        n = model.group_sample_n[g]
+        warnings.append(
+            f"行程グループ「{g}」の工数カーブは {n}/{len(curves)} 案件の実績しか"
+            f"根拠にしていない(閾値 {min_g})。その業務が無い案件は形の平均に参加しないため、"
+            "カーブの形は参考値として扱うこと。なお総量の比率は業務が無い案件も"
+            "0として平均に含めるため、その分だけ薄まっている。")
+
     for nm in model.ms_stats["マイルストーン名"]:
         if nm not in model.backbone and align:
             n = int(model.ms_stats.loc[model.ms_stats["マイルストーン名"] == nm, "件数"].iloc[0])

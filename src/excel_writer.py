@@ -455,10 +455,16 @@ def _sheet_conditions(wb, model, ds, fc, params: dict, warnings: list[str]):
                      col_width={"マイルストーン名": 22})
 
     r = _title(ws, r, "■ 行程グループ別 工数比率(学習値)", H2_FONT)
+    r = _note(ws, r, "件数 = そのグループの形状カーブの学習に参加した案件数。"
+                     "そのグループの業務が無い案件は形の平均に参加しないため、"
+                     "件数が少ないカーブは参考値として扱うこと。"
+                     "比率のほうは業務が無い案件も0として平均に含めている。")
     gdf = pd.DataFrame({"行程グループ": model.group_ratio.index,
-                        "比率": model.group_ratio.to_numpy()})
-    r, _, _ = _table(ws, r, gdf, num_fmt={"比率": "0.0%"},
-                     col_width={"行程グループ": 26, "比率": 12})
+                        "比率": model.group_ratio.to_numpy(),
+                        "件数": [model.group_sample_n.get(g, 0)
+                                 for g in model.group_ratio.index]})
+    r, _, _ = _table(ws, r, gdf, num_fmt={"比率": "0.0%", "件数": "0"},
+                     col_width={"行程グループ": 26, "比率": 12, "件数": 8})
 
     if warnings:
         r = _title(ws, r, "■ 警告", H2_FONT)
