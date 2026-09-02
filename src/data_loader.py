@@ -243,6 +243,9 @@ def _normalize_months(raw: pd.Series) -> tuple[pd.Series, dict | None, dict | No
     pd.period_range から作られるため常にゼロ埋めの 'YYYY-MM' だが、
     実績側が '2019-4' のようにゼロ埋めされていないと文字列として一致せず、
     build_project_curves の reindex で丸ごと落ちる。
+    実績CSV側の表記が首尾一貫していても関係ない。
+    ゼロ埋めなしで完全に統一されていても、10〜12月だけが偶然どちらの
+    表記でも同じ文字列になるため生き残り、1〜9月の9ヶ月分が消える。
     しかも文字列比較では '2019-4' > '2019-04' となるため、
     期間内のはずの実績が「契約期間外(終了後)」として除外され、
     警告を読んでも真因が年月の桁揃えだとはわからない。
@@ -359,10 +362,12 @@ def _read_actuals(path: str, use_cache: bool = True) -> tuple[pd.DataFrame, list
     df["月"], fixed_months, bad_months = _normalize_months(df["月"])
     if fixed_months:
         warnings.append(
-            f"実績データの「月」列が 'YYYY-MM' で揃っていない行が {fixed_months['count']:,} 行あり、"
+            f"実績データの「月」列に、本システムが内部で使う 'YYYY-MM' 形式"
+            f"(月を必ず2桁ゼロ埋め)と異なる表記が {fixed_months['count']:,} 行あり、"
             f"正規化しました(例: {fixed_months['examples']})。"
-            "正規化しないと案件の月リストと文字列一致せず、期間内の実績が"
-            "「契約期間外」として除外される。出力側の表記を揃えることが望ましい。"
+            "正規化しない場合は案件の月リストと文字列一致せず、期間内の実績が"
+            "「契約期間外」として除外される。1〜9月だけが該当するため"
+            "(10〜12月は両表記が同一)、実績の約4分の3が消える。"
         )
     if bad_months:
         warnings.append(
