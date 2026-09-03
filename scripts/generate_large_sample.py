@@ -30,7 +30,7 @@ data/ の小さいサンプルは高速な動作確認用に残す。
 
 一部の案件は α版 を一度で通過できず、2回・3回と訪れる。
 その手戻り期間には工数の山を余分に置いてある。
-横持ちマスタでは α版 の1セルにカンマ区切りで日付が並ぶ。
+横持ちマスタでは α版 の1セルにカンマ区切りで日付が並ぶ(例: 2020-04, 2020-08)。
 """
 
 from __future__ import annotations
@@ -296,11 +296,11 @@ def build_projects(rng, n_done, n_wip):
     return rows, progress
 
 
-def build_master(rows, ms_rows, out):
+def build_master(rows, ms_rows, out, precision="月"):
     wb = Workbook()
     ws = wb.active
     ws.title = "projects"
-    df = wide_projects_frame(rows, ms_rows)
+    df = wide_projects_frame(rows, ms_rows, precision)
     base = {"案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"}
     write_sheet(ws, df,
         widths={"案件ID": 12, "名称": 24, "種別": 20, "契約人月": 10,
@@ -311,7 +311,7 @@ def build_master(rows, ms_rows, out):
              "進行中案件は実績が途中までしか無く、終了は計画値である点に注意。"
              "ステータス列より右はマイルストーン列で、見出しがマイルストーン名、セルが日付。"
              "空欄=未記入。同じマイルストーンを複数回訪れた案件は、"
-             "同じセルにカンマ区切りで日付を並べる(例: 2020-04-18, 2020-08-22)。"
+             "同じセルにカンマ区切りで日付を並べる(例: 2020-04, 2020-08)。"
              "最終回が工程の境目、初回は「α版(初回)」として扱われる。")
 
     ws = wb.create_sheet("estimates")
@@ -334,7 +334,7 @@ def build_master(rows, ms_rows, out):
         ("位置合わせ", "ON", "マイルストーンによる位置合わせ"),
         ("背骨マイルストーン", "自動", "位置合わせに使うマイルストーン"),
         ("背骨最小カバー率", 0.6, "この割合以上の案件が持つものを背骨に採用"),
-        ("マイルストーン精度", "自動", "自動 / 月。月 にすると日付を月央に丸める(月まで表記に揃える)"),
+        ("マイルストーン精度", "月", "月 / 自動。既定の 月 は日付を月央に丸める"),
         ("位置合わせ強度", 1.0, "0〜1。実位置を正準位置へ引き戻す割合。下げると跳ねが減る"),
         ("伸縮率上限", 0, "時間軸の伸縮率の上限(倍)。0=無制限"),
         ("マイルストーン最小件数", 3, "この件数未満は参考値として警告"),
@@ -355,6 +355,8 @@ def main():
     ap.add_argument("--done", type=int, default=30)
     ap.add_argument("--wip", type=int, default=5)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--date-precision", choices=["月", "日"], default="月",
+                    help="マイルストーン日付の書き方。既定は 月(settings の既定に合わせる)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rng = np.random.default_rng(a.seed)
@@ -413,7 +415,7 @@ def main():
     actuals = actuals.sort_values(["案件ID", "月", "行程", "メンバー"]).reset_index(drop=True)
     csv = os.path.join(a.out, "actuals.csv")
     actuals.to_csv(csv, index=False, encoding="utf-8-sig")
-    build_master(out_rows, ms_rows, os.path.join(a.out, "master.xlsx"))
+    build_master(out_rows, ms_rows, os.path.join(a.out, "master.xlsx"), a.date_precision)
 
     print(f"実績CSV : {csv}  ({len(actuals):,} 行, {os.path.getsize(csv)/1e6:.1f} MB)")
     print(f"マスタ   : {os.path.join(a.out, 'master.xlsx')}")

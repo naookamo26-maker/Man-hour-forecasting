@@ -59,7 +59,7 @@ DEFAULT_SETTINGS = {
     "位置合わせ": "ON",
     "背骨マイルストーン": "自動",
     "背骨最小カバー率": 0.6,
-    "マイルストーン精度": "自動",
+    "マイルストーン精度": "月",
     "位置合わせ強度": 1.0,
     "伸縮率上限": 0.0,
     "マイルストーン最小件数": 3,
@@ -423,21 +423,33 @@ def load_all(master_path: str, actuals_path: str,
     # 「2020-08」と書いたつもりでも、Excel が勝手に 2020-08-01 という日付に
     # 変換してしまうことがある。そうなると読み込み側では月表記と区別がつかず、
     # 全マイルストーンが半月ぶん前に寄ったまま気づけない。
-    # settings の マイルストーン精度 を 月 にすると、日付の細部を捨てて月央へ揃える。
-    precision = str(settings.get("マイルストーン精度", "自動")).strip() or "自動"
+    # そこで既定は 月 とし、日付の細部を捨てて月央へ揃える。
+    # 実績が月単位である以上、日まで分かっても効果は小さく(完了30件で相対4%、
+    # 統計的にははっきりしない)、月初へ寄る事故のほうが害が大きい(同 12% 悪化)。
+    # 日付が正確に分かっていてその精度を使いたい場合だけ 自動 にする。
+    precision = str(settings.get("マイルストーン精度", "月")).strip() or "月"
     if precision not in ("自動", "月"):
         raise ValueError(
             f"マイルストーン精度 は 自動 / 月 のいずれかで指定してください(指定値: {precision!r})")
     if precision == "月" and not milestones.empty:
-        before = len(milestones.drop_duplicates(subset=["案件ID", "マイルストーン名", "日付"]))
-        milestones["日付"] = milestones["日付"].apply(month_center)
-        after = len(milestones.drop_duplicates(subset=["案件ID", "マイルストーン名", "日付"]))
-        ms_warnings.append(
-            "マイルストーン精度=月 のため、マイルストーンの日付を月央に丸めました。")
+        keys = ["案件ID", "マイルストーン名", "日付"]
+        before = len(milestones.drop_duplicates(subset=keys))
+        snapped = milestones["日付"].apply(month_center)
+        # 月央そのものでない日付が入っていた = 日まで書かれていた、ということ。
+        # 既定は月精度なのでその細部は使われない。黙って捨てると
+        # 「日まで入力したのに反映されない」の原因が追えなくなる。
+        n_day = int((milestones["日付"] != snapped).sum())
+        milestones["日付"] = snapped
+        after = len(milestones.drop_duplicates(subset=keys))
+        if n_day:
+            ms_warnings.append(
+                f"マイルストーン精度=月 のため、日まで書かれた {n_day} 件の日付を月央に丸めました。"
+                "日の精度をそのまま使いたい場合は settings の マイルストーン精度 を 自動 にすること"
+                "(ただし Excel が「2020-08」を 2020-08-01 に変換していないか要確認)。")
         if after < before:
             ms_warnings.append(
-                f"  同じ月に入った複数回のマイルストーン {before - after} 件が1件にまとまりました。"
-                "手戻り期間が1ヶ月未満だった分は区別できません。")
+                f"月に丸めた結果、同じ月に入った複数回のマイルストーン {before - after} 件が"
+                "1件にまとまりました。手戻り期間が1ヶ月未満だった分は区別できません。")
 
     milestones = milestones.drop_duplicates(subset=["案件ID", "マイルストーン名", "日付"])
     milestones, ms_attempts, repeat_warnings = _normalize_milestone_repeats(milestones)

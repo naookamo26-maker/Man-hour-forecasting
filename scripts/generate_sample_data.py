@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import os
 
@@ -413,14 +414,20 @@ def write_sheet(ws, df: pd.DataFrame, widths: dict[str, int] | None = None,
         c.fill = NOTE_FILL
 
 
-def wide_projects_frame(projects_rows, ms_rows) -> pd.DataFrame:
+def wide_projects_frame(projects_rows, ms_rows, precision: str = "月") -> pd.DataFrame:
     """案件行 + マイルストーン列 の横持ち表を作る。
 
     マイルストーン名は見出し行に1回だけ現れるので、表記の揺れが起きない。
     空欄は「未記入」を表し、どの案件に何が入っているかがシート上で一目で分かる。
     同じマイルストーンが複数回ある案件は、1つのセルにカンマ区切りで並べる
-    (「2020-04-18, 2020-08-22」)。列は増やさない。
+    (「2020-04, 2020-08」)。列は増やさない。
+
+    precision  "月" なら 2020-08、"日" なら 2020-08-22 と書き出す。
+               既定は月。settings の マイルストーン精度 の既定が 月 で、
+               日まで書いても月央に丸められるため、シートの見た目と
+               実際に使われる値を一致させておく。
     """
+    fmt = "%Y-%m" if precision == "月" else "%Y-%m-%d"
     base = ["案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"]
     df = pd.DataFrame(projects_rows, columns=base)
     ms = pd.DataFrame(ms_rows, columns=["案件ID", "マイルストーン名", "日付"])
@@ -443,18 +450,18 @@ def wide_projects_frame(projects_rows, ms_rows) -> pd.DataFrame:
         cells[(str(pid), nm)] = sorted(sub["日付"].tolist())
 
     for nm in order:
-        df[nm] = [", ".join(d.strftime("%Y-%m-%d") for d in cells.get((pid, nm), [])) or None
+        df[nm] = [", ".join(sorted({d.strftime(fmt) for d in cells.get((pid, nm), [])})) or None
                   for pid in df["案件ID"].astype(str)]
     return df
 
 
-def build_master(projects_rows, ms_rows):
+def build_master(projects_rows, ms_rows, precision: str = "月"):
     wb = Workbook()
 
     # --- projects ---
     ws = wb.active
     ws.title = "projects"
-    dfp = wide_projects_frame(projects_rows, ms_rows)
+    dfp = wide_projects_frame(projects_rows, ms_rows, precision)
     base = {"案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"}
     write_sheet(ws, dfp,
                 widths={"案件ID": 14, "名称": 30, "種別": 20, "契約人月": 12,
@@ -466,7 +473,7 @@ def build_master(projects_rows, ms_rows):
                      "ステータス列より右はマイルストーン列で、見出しがマイルストーン名、"
                      "セルが日付(YYYY-MM-DD)。空欄=未記入で、記入が無くても動作する(設計書 3-2)。"
                      "同じマイルストーンを一度で通過できず複数回訪れた場合は、"
-                     "同じセルにカンマ区切りで並べる(例: 2020-04-18, 2020-08-22)。列は増やさない。"
+                     "同じセルにカンマ区切りで並べる(例: 2020-04, 2020-08)。列は増やさない。"
                      "最終回を工程の境目、初回を「α版(初回)」という別のマイルストーンとして扱う。")
 
     # --- estimates ---
@@ -504,7 +511,7 @@ def build_master(projects_rows, ms_rows):
         ("位置合わせ", "ON", "ON/OFF。マイルストーンによる landmark registration(設計書 5 Step3)"),
         ("背骨マイルストーン", "自動", "位置合わせに使うマイルストーン名を ; 区切りで指定。自動=全案件共通のものを使う"),
         ("背骨最小カバー率", 0.6, "この割合以上の案件が持つマイルストーンを背骨に採用する。1.0=全案件必須"),
-        ("マイルストーン精度", "自動", "自動 / 月。月 にすると日付を月央に丸める(月まで表記に揃える)"),
+        ("マイルストーン精度", "月", "月 / 自動。既定の 月 は日付を月央に丸める。自動 は日まで書いた日付をそのまま使う"),
         ("位置合わせ強度", 1.0, "0〜1。実位置を正準位置へ引き戻す割合。下げると時間軸の伸縮が緩み、工数の跳ねが減る"),
         ("伸縮率上限", 0, "時間軸の伸縮率の上限(倍)。例 1.5。0=無制限。跳ねの高さに直接上限をかける"),
         ("マイルストーン最小件数", 3, "この件数未満の統計は参考値として警告する(設計書 11)"),
@@ -523,6 +530,10 @@ def build_master(projects_rows, ms_rows):
 
 # ============================================================================
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date-precision", choices=["月", "日"], default="月",
+                    help="マイルストーン日付の書き方。既定は 月(settings の既定に合わせる)")
+    args = ap.parse_args()
     os.makedirs(DATA_DIR, exist_ok=True)
 
     all_actuals = []
@@ -562,7 +573,7 @@ def main():
     out_csv = os.path.join(DATA_DIR, "actuals.csv")
     actuals.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    wb = build_master(project_rows, ms_rows)
+    wb = build_master(project_rows, ms_rows, args.date_precision)
     out_xlsx = os.path.join(DATA_DIR, "master.xlsx")
     wb.save(out_xlsx)
 

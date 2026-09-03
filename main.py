@@ -49,9 +49,9 @@ def parse_args(argv=None):
                    help="背骨マイルストーン名を ; 区切りで指定。既定は 自動")
     p.add_argument("--backbone-coverage", type=float, default=None,
                    help="背骨に採用するマイルストーンの最小カバー率(0〜1)")
-    p.add_argument("--ms-precision", choices=["自動", "月"], default=None,
-                   help="マイルストーン日付の精度。月 にすると日付を月央に丸める。"
-                        "月まで表記のつもりが Excel に日付化されている場合に使う")
+    p.add_argument("--ms-precision", choices=["月", "自動"], default=None,
+                   help="マイルストーン日付の精度。既定の 月 は日付を月央に丸める。"
+                        "自動 にすると日まで書いた日付をその精度のまま使う")
     p.add_argument("--warp-strength", type=float, default=None,
                    help="位置合わせの強さ 0〜1。1=マイルストーン日付ちょうどに合わせる(既定)。"
                         "下げるほど時間軸の伸縮がゆるくなり、工数の跳ねが小さくなる")
