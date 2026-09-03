@@ -181,7 +181,26 @@ def forecast(model: Model, ds, pid: str, *,
     if model.align and model.backbone:
         pairs = [(nm, model.canonical_anchor[nm], positions[nm])
                  for nm in model.backbone if nm in positions]
-        warp = Warp.build(pairs)
+        warp = Warp.build(pairs, strength=model.warp_strength,
+                          max_stretch=model.max_stretch)
+        if warp.clipped:
+            notes.append(
+                "マイルストーンの日付が近すぎる/順序が逆のため、時間軸上の位置を"
+                f"補正しました: {', '.join(warp.clipped)}。"
+                "補正で潰れた区間には工数が集中し、月次に大きな跳ねが出ます。"
+                "milestones シートの日付を確認してください。")
+        if not warp.is_identity and warp.max_step_ratio >= 2.0:
+            notes.append(
+                f"マイルストーンの間隔が学習データの平均から離れているため、"
+                f"時間軸の伸縮率がアンカーの前後で最大 {warp.max_step_ratio:.1f} 倍変わります"
+                f"(最大密度倍率 {warp.max_density_gain:.1f} 倍)。"
+                "その境目の月に工数の跳ねが出ます。"
+                "settings の 位置合わせ強度 を下げるか 伸縮率上限 を設定すると抑えられます。")
+        if model.warp_strength < 1.0 or (model.max_stretch or 0) > 1.0:
+            notes.append(
+                f"位置合わせを弱めて適用しています(位置合わせ強度 {model.warp_strength:g}"
+                + (f" / 伸縮率上限 {model.max_stretch:g} 倍" if (model.max_stretch or 0) > 1.0 else "")
+                + ")。跳ねを抑える代わりに、カーブの山はマイルストーンの日付ちょうどには来ません。")
         given_names = [nm for nm in model.backbone if source.get(nm) == "指定"]
         if given_names:
             notes.append(f"指定されたマイルストーンで時間軸を固定: {', '.join(given_names)}")

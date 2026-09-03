@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -68,39 +68,114 @@ class Warp:
     anchors_canonical[i] <-> anchors_actual[i] が対応する。
     両端の 0.0 / 1.0 は常に含める(案件の開始と終了は必ず一致する)。
     アンカーが両端だけなら恒等写像 = 位置合わせなし。
+
+    工数密度は「正準カーブ ÷ 伸縮率」で決まる(質量保存の帰結)。
+    区分線形なので伸縮率は区間ごとに一定で、アンカーの前後で不連続に切り替わる。
+    隣り合う区間の伸縮率が k 倍違えば、そのアンカーの位置で月次工数が k 倍跳ねる。
+    これが位置合わせを入れたときに出る「工数の跳ね」の正体である。
+    stretch_factors() / max_step_ratio がその大きさを測る口で、
+    build() の strength・max_stretch がそれを抑える口になる。
     """
 
     anchors_canonical: np.ndarray
     anchors_actual: np.ndarray
     names: list[str]
+    clipped: list[str] = field(default_factory=list)
+    # 単調性・min_gap の補正で実位置を動かしたマイルストーン名。
+    # 補正が起きた時点で「指定された日付どおりには貼れていない」ため、
+    # 黙って進むと利用者は原因不明の跳ねだけを見ることになる。
 
     @classmethod
     def identity(cls) -> "Warp":
         return cls(np.array([0.0, 1.0]), np.array([0.0, 1.0]), [])
 
     @classmethod
-    def build(cls, pairs: list[tuple[str, float, float]], min_gap: float = 0.02) -> "Warp":
+    def build(cls, pairs: list[tuple[str, float, float]], min_gap: float = 0.02,
+              strength: float = 1.0, max_stretch: float | None = None) -> "Warp":
         """pairs = [(名前, 正準位置, 実位置), ...] からワープを作る。
 
         単調増加が崩れる指定(β版がα版より前 等)は順序を保つよう補正する。
         補正しないと逆変換が壊れ、工数が時間軸上で折り返してしまう。
+
+        strength     位置合わせの強さ 0〜1。実位置を正準位置へ向けて引き戻す。
+                     1.0 = 実位置ちょうどに合わせる(従来の挙動)。
+                     0.0 = 恒等写像 = 位置合わせなし。
+                     マイルストーンの記入数が少ないと正準位置(=平均位置)自体が
+                     不安定なので、そこへ全力で合わせると伸縮率が極端になる。
+        max_stretch  区間ごとの伸縮率 du/ds を [1/k, k] に収める。
+                     跳ねの高さの上限を直接決める。
+                     None(または 1 以下)なら制限しない。
+
+        strength・max_stretch を効かせるとアンカーは指定日付から動く。
+        カーブの山がマイルストーンちょうどに来なくなる代わりに、
+        跳ねが抑えられる。どちらを取るかは leave-one-out の数字で決めること。
         """
         pairs = sorted(pairs, key=lambda p: p[1])
-        names, canon, actual = [], [0.0], [0.0]
+        names, canon, actual, clipped = [], [0.0], [0.0], []
         for nm, c, a in pairs:
             if c <= canon[-1] + min_gap or c >= 1.0 - min_gap:
                 continue
-            a = float(np.clip(a, actual[-1] + min_gap, 1.0 - min_gap))
+            a_raw = float(a)
+            if strength < 1.0:
+                # 正準位置へ向けて引き戻す。strength=0 で完全に正準位置 = 恒等写像。
+                a_raw = strength * a_raw + (1.0 - strength) * float(c)
+            a = float(np.clip(a_raw, actual[-1] + min_gap, 1.0 - min_gap))
+            if abs(a - a_raw) > 1e-9:
+                # 日付が逆順・同月に詰まっている等で、指定どおりには置けなかった。
+                # min_gap まで潰れた区間には強烈な圧縮が残り、跳ねの主因になる。
+                clipped.append(nm)
             names.append(nm)
             canon.append(float(c))
             actual.append(a)
         canon.append(1.0)
         actual.append(1.0)
-        return cls(np.array(canon), np.array(actual), names)
+        w = cls(np.array(canon), np.array(actual), names, clipped)
+        if max_stretch and max_stretch > 1.0 and not w.is_identity:
+            w = w._cap_stretch(float(max_stretch))
+        return w
+
+    def _cap_stretch(self, k: float) -> "Warp":
+        """区間ごとの伸縮率を [1/k, k] に収めたワープを返す。
+
+        実区間の幅を伸縮率ごとクリップし、合計1へ正規化する。
+        正規化で全区間が一律に伸び縮みして再び上限を超えうるため、収束するまで繰り返す。
+        正準側の位置は動かさない(学習カーブ側の座標なので動かしてはいけない)。
+        """
+        dc = np.diff(self.anchors_canonical)
+        da = np.diff(self.anchors_actual)
+        for _ in range(50):
+            j = da / dc
+            if j.max() <= k + 1e-9 and j.min() >= 1.0 / k - 1e-9:
+                break
+            da = np.clip(j, 1.0 / k, k) * dc
+            da = da / da.sum()
+        actual = np.concatenate([[0.0], np.cumsum(da)])
+        actual[-1] = 1.0
+        return Warp(self.anchors_canonical.copy(), actual, list(self.names),
+                    list(self.clipped))
 
     @property
     def is_identity(self) -> bool:
         return len(self.names) == 0
+
+    def stretch_factors(self) -> np.ndarray:
+        """区間ごとの伸縮率 du/ds。1 より小さい区間は工数密度がその逆数倍に濃くなる。"""
+        return np.diff(self.anchors_actual) / np.diff(self.anchors_canonical)
+
+    @property
+    def max_density_gain(self) -> float:
+        """最も圧縮された区間の密度倍率。学習カーブの山がこの倍率で縦に伸びる。"""
+        j = self.stretch_factors()
+        return float(1.0 / j.min()) if j.min() > 0 else float("inf")
+
+    @property
+    def max_step_ratio(self) -> float:
+        """隣り合う区間の伸縮率の比の最大。アンカーの前後で工数が何倍跳ぶか。"""
+        j = self.stretch_factors()
+        if len(j) < 2:
+            return 1.0
+        r = j[:-1] / j[1:]
+        return float(max(r.max(), (1.0 / r).max()))
 
     def to_actual(self, s):
         """正準時間軸 -> 実時間軸(予測で使う)。"""
@@ -115,7 +190,9 @@ class Warp:
             return "位置合わせなし(恒等写像)"
         parts = [f"{nm}: {c:.3f}->{a:.3f}" for nm, c, a
                  in zip(self.names, self.anchors_canonical[1:-1], self.anchors_actual[1:-1])]
-        return " / ".join(parts)
+        s = " / ".join(parts)
+        return (f"{s} [最大密度倍率 {self.max_density_gain:.2f} / "
+                f"アンカー段差 {self.max_step_ratio:.2f}]")
 
 
 # ---------------------------------------------------------------------------

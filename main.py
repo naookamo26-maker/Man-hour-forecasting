@@ -49,6 +49,12 @@ def parse_args(argv=None):
                    help="背骨マイルストーン名を ; 区切りで指定。既定は 自動")
     p.add_argument("--backbone-coverage", type=float, default=None,
                    help="背骨に採用するマイルストーンの最小カバー率(0〜1)")
+    p.add_argument("--warp-strength", type=float, default=None,
+                   help="位置合わせの強さ 0〜1。1=マイルストーン日付ちょうどに合わせる(既定)。"
+                        "下げるほど時間軸の伸縮がゆるくなり、工数の跳ねが小さくなる")
+    p.add_argument("--max-stretch", type=float, default=None,
+                   help="時間軸の伸縮率の上限(倍)。例 1.5 なら区間の伸縮を 1/1.5〜1.5 倍に抑える。"
+                        "0 または未指定で無制限")
     p.add_argument("--exclude-group", default=None,
                    help="この案件が行わない行程グループを ; 区切りで指定し、予測から外す。"
                         "estimates シートに見積もりがある場合は、そちらが優先される")
@@ -90,6 +96,10 @@ def _run(argv=None) -> int:
         overrides["背骨マイルストーン"] = a.backbone
     if a.backbone_coverage is not None:
         overrides["背骨最小カバー率"] = a.backbone_coverage
+    if a.warp_strength is not None:
+        overrides["位置合わせ強度"] = a.warp_strength
+    if a.max_stretch is not None:
+        overrides["伸縮率上限"] = a.max_stretch
     if a.reconstruct:
         overrides["カーブ復元"] = RECON_BOX if a.reconstruct == "box" else RECON_SMOOTH
 
@@ -104,6 +114,15 @@ def _run(argv=None) -> int:
     backbone_spec = str(ds.settings["背骨マイルストーン"])
     coverage = float(ds.settings["背骨最小カバー率"])
     recon = str(ds.settings["カーブ復元"])
+    warp_strength = float(ds.settings["位置合わせ強度"])
+    if not 0.0 <= warp_strength <= 1.0:
+        raise ValueError(f"位置合わせ強度 は 0〜1 の範囲で指定してください(指定値: {warp_strength})")
+    max_stretch_raw = float(ds.settings["伸縮率上限"])
+    max_stretch = max_stretch_raw if max_stretch_raw > 1.0 else None
+    if 0.0 < max_stretch_raw <= 1.0:
+        raise ValueError(
+            f"伸縮率上限 は 1 より大きい値(例 1.5)か、無制限を表す 0 を指定してください"
+            f"(指定値: {max_stretch_raw})")
     if recon not in RECON_MODES:
         raise ValueError(f"カーブ復元 は {' / '.join(RECON_MODES)} のいずれか(指定値: {recon!r})")
     hpm = ds.hours_per_mm
@@ -123,7 +142,8 @@ def _run(argv=None) -> int:
     # --- 学習 ---
     model = learn(curves, groups, align=align, n_bin=n_bin,
                   backbone_spec=backbone_spec, backbone_coverage=coverage,
-                  hours_per_mm=hpm, recon=recon)
+                  hours_per_mm=hpm, recon=recon,
+                  warp_strength=warp_strength, max_stretch=max_stretch)
     model_naive = (learn(curves, groups, align=False, n_bin=n_bin, hours_per_mm=hpm,
                          recon=recon)
                    if align else None)
@@ -158,6 +178,29 @@ def _run(argv=None) -> int:
                 "位置合わせには使っていない。")
     if not align:
         warnings.append("位置合わせ OFF で実行。マイルストーン直前の工数の山は平均によってならされている。")
+
+    # 位置合わせは時間軸を区間ごとに伸縮させる。伸縮率はアンカーの前後で不連続に変わり、
+    # その比がそのまま月次工数の跳ねの倍率になる。極端な案件は学習カーブを歪め、
+    # その案件自身の予測では月次グラフに大きな段差として現れる。
+    # どの案件のマイルストーンが原因かは、ここを見ないと特定できない。
+    if align and model.backbone:
+        clipped = [(p_, c.warp.clipped) for p_, c in curves.items() if c.warp.clipped]
+        for p_, nms in clipped:
+            warnings.append(
+                f"{p_} はマイルストーン {', '.join(nms)} の日付が近すぎる/順序が逆のため、"
+                "時間軸上の位置を補正した。補正で潰れた区間に工数が集中し、"
+                "学習カーブを歪める。milestones シートの日付を確認すること。")
+        steep = sorted(((c.warp.max_step_ratio, p_, c) for p_, c in curves.items()
+                        if not c.warp.is_identity), reverse=True)
+        for ratio, p_, c in steep:
+            if ratio < 3.0:
+                break
+            warnings.append(
+                f"{p_}({c.name}, {len(c.months)}ヶ月, 実績 {c.total_hours / hpm:,.0f} 人月)は"
+                f"マイルストーン位置が学習データの平均から離れており、時間軸の伸縮率が"
+                f"アンカーの前後で {ratio:.1f} 倍変わる(最大密度倍率 {c.warp.max_density_gain:.1f} 倍)。"
+                "この案件は学習カーブを尖らせる側にも、自身の予測が跳ねる側にも効く。"
+                "scripts/diagnose_warp.py で影響を確認し、必要なら 位置合わせ強度 を下げること。")
 
     # 契約人月と実績合計の乖離。学習結果には影響しないが、実績側の欠落を疑う手がかりになる。
     gap = model.contributors.dropna(subset=["乖離率(%)"])
@@ -203,7 +246,8 @@ def _run(argv=None) -> int:
         recons = (recon,) if a.no_compare_recon else RECON_MODES
         detail, monthly, summary = leave_one_out(
             ds, curves, groups, n_bin=n_bin, backbone_spec=backbone_spec,
-            backbone_coverage=coverage, hours_per_mm=hpm, recons=recons)
+            backbone_coverage=coverage, hours_per_mm=hpm, recons=recons,
+            warp_strength=warp_strength, max_stretch=max_stretch)
         print("[5/5] 検証      leave-one-out 完了")
         print()
         for _, r in summary.iterrows():
@@ -228,6 +272,8 @@ def _run(argv=None) -> int:
         "位置合わせ": "ON" if align else "OFF",
         "背骨マイルストーン": ", ".join(model.backbone) or "(なし)",
         "背骨最小カバー率": coverage,
+        "位置合わせ強度": warp_strength,
+        "伸縮率上限": max_stretch or "無制限",
         "カーブ復元": recon,
         "カーブ解像度": n_bin,
         "人月換算係数": hpm,
