@@ -58,17 +58,27 @@ def _safe_positive(v) -> float | None:
 
 
 def resolve_milestone_positions(model: Model, ds, pid: str, months: list[str],
-                                use_given: bool = True) -> tuple[dict, dict]:
+                                use_given: bool = True,
+                                known_milestones: set[str] | None = None
+                                ) -> tuple[dict, dict]:
     """対象案件のマイルストーン位置(経過期間比)を決める(設計書 6 Step2)。
 
     人が指定した日付があればそれを正とし、無いものは学習した平均位置を使う。
     「マイルストーンが決まっている / いない」が同じ仕組みの入力有無だけで切り替わる。
+
+    known_milestones を渡すと、そこに載っている名前の日付だけを使う。
+    途中まで実績が確定している時点を再現するときに要る。
+    その時点ではまだ通過していないマイルストーンの実日付は分かっておらず、
+    渡してしまうと未来の情報で位置合わせすることになる(src/phased.py)。
     """
     given = {}
     if use_given:
         ms = ds.milestones_of(pid)
         for _, r in ms.iterrows():
-            given[r["マイルストーン名"]] = date_to_t(months, r["日付"])
+            nm = r["マイルストーン名"]
+            if known_milestones is not None and nm not in known_milestones:
+                continue
+            given[nm] = date_to_t(months, r["日付"])
 
     positions, source = {}, {}
     for _, r in model.ms_stats.iterrows():
@@ -89,6 +99,7 @@ def resolve_milestone_positions(model: Model, ds, pid: str, months: list[str],
 
 def forecast(model: Model, ds, pid: str, *,
              use_given_milestones: bool = True,
+             known_milestones: set[str] | None = None,
              group_totals: dict[str, float] | None = None,
              months_override: list[str] | None = None,
              exclude_groups: list[str] | None = None) -> Forecast:
@@ -174,8 +185,9 @@ def forecast(model: Model, ds, pid: str, *,
         notes.append(f"この案件が行わない行程グループとして除外: {', '.join(dropped)}")
 
     # --- Step 2: マイルストーン位置 ---
-    positions, source = resolve_milestone_positions(model, ds, pid, months,
-                                                    use_given=use_given_milestones)
+    positions, source = resolve_milestone_positions(
+        model, ds, pid, months, use_given=use_given_milestones,
+        known_milestones=known_milestones)
 
     # --- Step 3: ワープを組み、カーブを貼る ---
     if model.align and model.backbone:
