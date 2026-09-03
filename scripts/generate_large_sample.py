@@ -21,6 +21,16 @@ data/ の小さいサンプルは高速な動作確認用に残す。
   - 実績が途中で切れる(α版通過直後 〜 マスターアップ直前まで様々)
   - 終了日は計画値であり、実際の完了月とはずれる
   - まだ来ていないマイルストーンは計画日として入っている
+
+工数カーブの形も1種類ではない。中央に山が1つの案件のほかに、
+前半が緩やかで後半に一気に消化する案件、早めに片付いて終盤が落ち着く案件、
+山が2つに割れる案件を混ぜてある(generate_sample_data.PACE)。
+マイルストーンの位置は動かさないので、
+「マイルストーンでは説明できない形のばらつき」がデータに残る。
+
+一部の案件は α版 を一度で通過できず、2回・3回と訪れる。
+その手戻り期間には工数の山を余分に置いてある。
+横持ちマスタでは α版 / α版#2 / α版#3 という列になる。
 """
 
 from __future__ import annotations
@@ -32,8 +42,9 @@ import os
 import numpy as np
 import pandas as pd
 
-from generate_sample_data import (HEADER_FILL, HEADER_FONT, beta_pdf,
-                                  month_edges_t, month_range, write_sheet)
+from generate_sample_data import (HEADER_FILL, HEADER_FONT, PACE, beta_pdf,
+                                  month_edges_t, month_range, pace_names,
+                                  wide_projects_frame, write_sheet)
 from openpyxl import Workbook
 
 HOURS_PER_MM = 160
@@ -174,8 +185,13 @@ def member_pool(rng, pid, outsourced):
     return pool
 
 
-def gen_actuals(rng, pid, ptype, mm, months, tags):
-    """1案件の実績を作る。戻り値 (DataFrame, マイルストーン実位置)。"""
+def gen_actuals(rng, pid, ptype, mm, months, tags, pace="標準", retries=1):
+    """1案件の実績を作る。戻り値 (DataFrame, マイルストーン実位置, α版の各回の位置)。
+
+    pace     消化ペースの型(generate_sample_data.PACE)。工数を置く位置だけを前後に移す。
+    retries  α版を通過するまでに要した回数。2以上なら初回〜最終の間が手戻り期間になり、
+             そこに工数の山を余分に置く。実データではここが工数の跳ねの原因になる。
+    """
     n_month = len(months)
     edges = month_edges_t(months)
     names = ["プロトタイプ", "α版", "β版", "マスターアップ"] if ptype == "新規タイトル開発" \
@@ -193,15 +209,28 @@ def gen_actuals(rng, pid, ptype, mm, months, tags):
 
     n_grid = 4000
     s_mid = (np.arange(n_grid) + 0.5) / n_grid
-    u_mid = np.interp(s_mid, xs, ys)
+    # 消化ペース: 工数の量は変えず、置く位置だけを移す(単調増加・両端固定)
+    u_mid = np.interp(np.clip(PACE[pace](s_mid), 0.0, 1.0), xs, ys)
     bin_idx = np.clip(np.searchsorted(edges, u_mid, side="right") - 1, 0, n_month - 1)
+
+    # α版のやり直し: 初回に落ちてから通過するまでが手戻り期間。
+    # その間は作り直しの工数が乗るので、実データでは山になる。
+    alpha_attempts = [ms_pos["α版"]]
+    boost = np.ones(n_month)
+    if retries > 1:
+        span = float(rng.uniform(0.06, 0.13)) * (retries - 1)
+        first = float(max(0.04, ms_pos["α版"] - span))
+        alpha_attempts = list(np.linspace(first, ms_pos["α版"], retries))
+        mid_u = (edges[:-1] + edges[1:]) / 2
+        center, width = (first + ms_pos["α版"]) / 2, max(span / 2, 0.02)
+        boost = 1.0 + (0.30 * (retries - 1)) * np.exp(-0.5 * ((mid_u - center) / width) ** 2)
 
     rec = []
     for gi, group in enumerate(GROUPS):
         dens = canonical_density(group, s_mid)
         dens = dens / dens.sum()
         monthly = np.bincount(bin_idx, weights=dens, minlength=n_month)
-        monthly = np.clip(monthly * (1.0 + rng.normal(0, 0.05, size=n_month)), 0, None)
+        monthly = np.clip(monthly * boost * (1.0 + rng.normal(0, 0.05, size=n_month)), 0, None)
         monthly = monthly / monthly.sum() * total_hours * share[gi]
 
         entries = pool[group]
@@ -228,8 +257,9 @@ def gen_actuals(rng, pid, ptype, mm, months, tags):
                     affil, team = meta[mid]
                     rec.append((pid, phase, mid, affil, team, month, h))
 
-    return pd.DataFrame(rec, columns=["案件ID", "行程", "メンバー", "所属",
-                                      "チーム", "月", "時間"]), ms_pos
+    return (pd.DataFrame(rec, columns=["案件ID", "行程", "メンバー", "所属",
+                                       "チーム", "月", "時間"]),
+            ms_pos, alpha_attempts)
 
 
 # ==========================================================================
@@ -270,25 +300,24 @@ def build_master(rows, ms_rows, out):
     wb = Workbook()
     ws = wb.active
     ws.title = "projects"
-    write_sheet(ws, pd.DataFrame(rows, columns=[
-        "案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"]),
-        widths={"案件ID": 12, "名称": 20, "種別": 20, "契約人月": 10,
+    df = wide_projects_frame(rows, ms_rows)
+    base = {"案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"}
+    write_sheet(ws, df,
+        widths={"案件ID": 12, "名称": 24, "種別": 20, "契約人月": 10,
                 "開始": 10, "終了": 10, "タグ": 40, "ステータス": 12},
-        input_cols={"契約人月", "開始", "終了", "タグ", "ステータス"},
+        input_cols=({"契約人月", "開始", "終了", "タグ", "ステータス"}
+                    | {c for c in df.columns if c not in base}),
         note="【凡例】ステータス: 完了 / 進行中 / 予測対象。"
-             "進行中案件は実績が途中までしか無く、終了は計画値である点に注意。")
+             "進行中案件は実績が途中までしか無く、終了は計画値である点に注意。"
+             "ステータス列より右はマイルストーン列で、見出しがマイルストーン名、セルが日付。"
+             "空欄=未記入。同じマイルストーンを複数回訪れた案件は α版 / α版#2 と列が増える"
+             "(最終回が工程の境目、初回は「α版(初回)」として扱われる)。")
 
     ws = wb.create_sheet("estimates")
     write_sheet(ws, pd.DataFrame(columns=["案件ID", "行程グループ", "見積人月"]),
                 widths={"案件ID": 14, "行程グループ": 26, "見積人月": 12},
                 input_cols={"行程グループ", "見積人月"},
                 note="【凡例】着手前の案件の要素別見積もり。書いた行程グループだけが予測対象になる。")
-
-    ws = wb.create_sheet("milestones")
-    write_sheet(ws, pd.DataFrame(ms_rows, columns=["案件ID", "マイルストーン名", "日付"]),
-                widths={"案件ID": 12, "マイルストーン名": 20, "日付": 14},
-                input_cols={"マイルストーン名", "日付"},
-                note="【凡例】進行中案件の未到達マイルストーンは計画日。")
 
     ws = wb.create_sheet("phase_map")
     pm = [(p, p, g, MAJOR[g]) for g, ps in PHASES.items() for p, _ in ps]
@@ -304,6 +333,8 @@ def build_master(rows, ms_rows, out):
         ("位置合わせ", "ON", "マイルストーンによる位置合わせ"),
         ("背骨マイルストーン", "自動", "位置合わせに使うマイルストーン"),
         ("背骨最小カバー率", 0.6, "この割合以上の案件が持つものを背骨に採用"),
+        ("位置合わせ強度", 1.0, "0〜1。実位置を正準位置へ引き戻す割合。下げると跳ねが減る"),
+        ("伸縮率上限", 0, "時間軸の伸縮率の上限(倍)。0=無制限"),
         ("マイルストーン最小件数", 3, "この件数未満は参考値として警告"),
         ("行程グループ最小件数", 3, "この件数未満のカーブは参考値として警告"),
         ("カーブ解像度", 100, "正準時間軸の分割数"),
@@ -327,9 +358,21 @@ def main():
     rng = np.random.default_rng(a.seed)
 
     rows, progress = build_projects(rng, a.done, a.wip)
-    all_df, ms_rows, summary = [], [], []
+    # 消化ペースと、α版のやり直し回数を案件ごとに割り当てる。
+    # やり直しは 1回(=一発合格)が大半で、2回・3回が混ざる実データの姿に合わせる。
+    live = [r for r in rows if r[7] != "予測対象"]
+    paces = dict(zip([r[0] for r in live], pace_names(len(live), rng)))
+    retries = {r[0]: int(rng.choice([1, 1, 1, 1, 2, 2, 3], p=None)) for r in live}
+
+    all_df, ms_rows, summary, out_rows = [], [], [], []
 
     for pid, name, ptype, mm, start, end, tags, status in rows:
+        pace, n_try = paces.get(pid, "標準"), retries.get(pid, 1)
+        label = [] if pace == "標準" else [pace]
+        if n_try > 1:
+            label.append(f"α{n_try}回")
+        name = f"{name}({'・'.join(label)})" if label else name
+        out_rows.append((pid, name, ptype, mm, start, end, tags, status))
         months = month_range(start, end)
         if status == "予測対象":
             for nm in ("α版", "β版"):
@@ -337,7 +380,8 @@ def main():
             summary.append((pid, ptype, mm, len(months), 0, "実績なし"))
             continue
 
-        df, ms_pos = gen_actuals(rng, pid, ptype, mm, months, tags)
+        df, ms_pos, alpha_attempts = gen_actuals(
+            rng, pid, ptype, mm, months, tags, pace=pace, retries=n_try)
 
         if status == "進行中":
             # 実績を進捗率のところで打ち切る。以降は「まだ記録されていない」
@@ -347,22 +391,27 @@ def main():
             for nm, t in ms_pos.items():
                 if nm == "マスターアップ" and t > progress[pid]:
                     continue          # 未到達かつ計画も入れない
-                ms_rows.append((pid, nm, t_to_date(months, t)))
+                for tt in (alpha_attempts if nm == "α版" else [t]):
+                    if nm == "α版" and tt > progress[pid]:
+                        continue
+                    ms_rows.append((pid, nm, t_to_date(months, tt)))
             summary.append((pid, ptype, mm, len(months), len(df),
                             f"{df['時間'].sum()/HOURS_PER_MM:.0f}人月 "
-                            f"(進捗{progress[pid]:.0%}・{cut}/{len(months)}ヶ月)"))
+                            f"(進捗{progress[pid]:.0%}・{cut}/{len(months)}ヶ月) "
+                            f"/ {pace}・α{n_try}回"))
         else:
             for nm, t in ms_pos.items():
-                ms_rows.append((pid, nm, t_to_date(months, t)))
+                for tt in (alpha_attempts if nm == "α版" else [t]):
+                    ms_rows.append((pid, nm, t_to_date(months, tt)))
             summary.append((pid, ptype, mm, len(months), len(df),
-                            f"{df['時間'].sum()/HOURS_PER_MM:.0f}人月"))
+                            f"{df['時間'].sum()/HOURS_PER_MM:.0f}人月 / {pace}・α{n_try}回"))
         all_df.append(df)
 
     actuals = pd.concat(all_df, ignore_index=True)
     actuals = actuals.sort_values(["案件ID", "月", "行程", "メンバー"]).reset_index(drop=True)
     csv = os.path.join(a.out, "actuals.csv")
     actuals.to_csv(csv, index=False, encoding="utf-8-sig")
-    build_master(rows, ms_rows, os.path.join(a.out, "master.xlsx"))
+    build_master(out_rows, ms_rows, os.path.join(a.out, "master.xlsx"))
 
     print(f"実績CSV : {csv}  ({len(actuals):,} 行, {os.path.getsize(csv)/1e6:.1f} MB)")
     print(f"マスタ   : {os.path.join(a.out, 'master.xlsx')}")
