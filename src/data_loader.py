@@ -36,6 +36,12 @@ PROJECT_BASE_COLS = ("案件ID", "名称", "種別", "契約人月", "開始", "
 # 列を増やす方式は、記入する列を間違える・列を足し忘れるといった事故が起きるため使わない。
 _DATE_SEPARATORS = re.compile(r"[,、;；\n\r]+")
 
+# 月までの表記。開始・終了と同じ粒度で書けるようにする。
+#   2020-08 / 2020/8 / 2020年8月
+# 月表記はその月の中央として扱う。月初として扱うと、実際の日付が月内に散っている分
+# だけ全部のマイルストーンが半月ぶん前へずれ、系統的な誤差になる(README の実測参照)。
+_MONTH_ONLY = re.compile(r"^\s*(\d{4})\s*[-/年.]\s*(\d{1,2})\s*月?\s*$")
+
 # 見出しが重複したときの後始末。
 # 利用者が同じ見出しを2つ作ってしまうと pandas が α版.1 のように直すので、
 # その分は同じマイルストーンとして読み直す(セルを移し替えさせない)。
@@ -53,6 +59,7 @@ DEFAULT_SETTINGS = {
     "位置合わせ": "ON",
     "背骨マイルストーン": "自動",
     "背骨最小カバー率": 0.6,
+    "マイルストーン精度": "自動",
     "位置合わせ強度": 1.0,
     "伸縮率上限": 0.0,
     "マイルストーン最小件数": 3,
@@ -184,6 +191,18 @@ def _read_settings(path: str) -> dict:
     return out
 
 
+def month_center(month) -> pd.Timestamp:
+    """月をその月の中央の時点として返す。
+
+    月までしか分からないマイルストーンを時間軸上の1点に置くとき、
+    月初に置くと実際の日付が月内に散っているぶんだけ半月ぶん前へ寄る。
+    全案件で同じ向きにずれるので、これは平均で消えない系統誤差になる。
+    月央なら、月内で一様に散っていると仮定したときのずれが期待値ゼロになる。
+    """
+    p = pd.Period(str(month)[:7], freq="M")
+    return p.start_time + (p.end_time - p.start_time) / 2
+
+
 def _parse_dates_cell(v) -> list[pd.Timestamp]:
     """1セルの値を日付のリストにする。
 
@@ -192,6 +211,8 @@ def _parse_dates_cell(v) -> list[pd.Timestamp]:
     区切りはカンマ・読点・セミコロン・改行を受け付ける。
     日付そのものが 2020/4/18 のようにスラッシュを含むため、
     スラッシュは区切りにしない。
+
+    開始・終了と同じ「2020-08」という月までの表記も書ける。その場合は月央として扱う。
     """
     if v is None or (not isinstance(v, str) and pd.isna(v)):
         return []
@@ -200,6 +221,14 @@ def _parse_dates_cell(v) -> list[pd.Timestamp]:
     parts = [p.strip() for p in _DATE_SEPARATORS.split(str(v)) if p.strip()]
     out = []
     for p in parts:
+        m = _MONTH_ONLY.match(p)
+        if m:
+            # 13月のような値は月表記として成立しないので、読めない値として扱う。
+            try:
+                out.append(month_center(f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"))
+            except Exception:
+                out.append(None)
+            continue
         d = pd.to_datetime(p, errors="coerce")
         out.append(d if pd.notna(d) else None)
     return out
@@ -367,6 +396,10 @@ def load_all(master_path: str, actuals_path: str,
         projects["タグ"] = ""
     projects["タグ"] = projects["タグ"].fillna("")
 
+    settings = _read_settings(master_path)
+    if overrides:
+        settings.update({k: v for k, v in overrides.items() if v is not None})
+
     # マイルストーンは projects シートの右側に列として書く形が本命。
     # 旧形式(別シート)も読めるようにしてあるので、移行の途中でも動く。
     projects, wide_ms, ms_warnings = _milestones_from_projects(projects)
@@ -386,6 +419,26 @@ def load_all(master_path: str, actuals_path: str,
         sheet_ms = pd.DataFrame(columns=["案件ID", "マイルストーン名", "日付"])
 
     milestones = pd.concat([wide_ms, sheet_ms], ignore_index=True)
+
+    # 「2020-08」と書いたつもりでも、Excel が勝手に 2020-08-01 という日付に
+    # 変換してしまうことがある。そうなると読み込み側では月表記と区別がつかず、
+    # 全マイルストーンが半月ぶん前に寄ったまま気づけない。
+    # settings の マイルストーン精度 を 月 にすると、日付の細部を捨てて月央へ揃える。
+    precision = str(settings.get("マイルストーン精度", "自動")).strip() or "自動"
+    if precision not in ("自動", "月"):
+        raise ValueError(
+            f"マイルストーン精度 は 自動 / 月 のいずれかで指定してください(指定値: {precision!r})")
+    if precision == "月" and not milestones.empty:
+        before = len(milestones.drop_duplicates(subset=["案件ID", "マイルストーン名", "日付"]))
+        milestones["日付"] = milestones["日付"].apply(month_center)
+        after = len(milestones.drop_duplicates(subset=["案件ID", "マイルストーン名", "日付"]))
+        ms_warnings.append(
+            "マイルストーン精度=月 のため、マイルストーンの日付を月央に丸めました。")
+        if after < before:
+            ms_warnings.append(
+                f"  同じ月に入った複数回のマイルストーン {before - after} 件が1件にまとまりました。"
+                "手戻り期間が1ヶ月未満だった分は区別できません。")
+
     milestones = milestones.drop_duplicates(subset=["案件ID", "マイルストーン名", "日付"])
     milestones, ms_attempts, repeat_warnings = _normalize_milestone_repeats(milestones)
     ms_warnings.extend(repeat_warnings)
@@ -409,10 +462,6 @@ def load_all(master_path: str, actuals_path: str,
     phase_map = _read_table(master_path, "phase_map")
     for c in phase_map.columns:
         phase_map[c] = phase_map[c].astype(str).str.strip()
-
-    settings = _read_settings(master_path)
-    if overrides:
-        settings.update({k: v for k, v in overrides.items() if v is not None})
 
     # 集約軸は settings と overrides の両方で決まるため、確定した後に検証する。
     phase_map, phase_map_warnings = _check_phase_map(phase_map, str(settings["集約軸"]))

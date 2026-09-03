@@ -49,6 +49,9 @@ def parse_args(argv=None):
                    help="背骨マイルストーン名を ; 区切りで指定。既定は 自動")
     p.add_argument("--backbone-coverage", type=float, default=None,
                    help="背骨に採用するマイルストーンの最小カバー率(0〜1)")
+    p.add_argument("--ms-precision", choices=["自動", "月"], default=None,
+                   help="マイルストーン日付の精度。月 にすると日付を月央に丸める。"
+                        "月まで表記のつもりが Excel に日付化されている場合に使う")
     p.add_argument("--warp-strength", type=float, default=None,
                    help="位置合わせの強さ 0〜1。1=マイルストーン日付ちょうどに合わせる(既定)。"
                         "下げるほど時間軸の伸縮がゆるくなり、工数の跳ねが小さくなる")
@@ -96,6 +99,8 @@ def _run(argv=None) -> int:
         overrides["背骨マイルストーン"] = a.backbone
     if a.backbone_coverage is not None:
         overrides["背骨最小カバー率"] = a.backbone_coverage
+    if a.ms_precision is not None:
+        overrides["マイルストーン精度"] = a.ms_precision
     if a.warp_strength is not None:
         overrides["位置合わせ強度"] = a.warp_strength
     if a.max_stretch is not None:
@@ -272,6 +277,7 @@ def _run(argv=None) -> int:
         "位置合わせ": "ON" if align else "OFF",
         "背骨マイルストーン": ", ".join(model.backbone) or "(なし)",
         "背骨最小カバー率": coverage,
+        "マイルストーン精度": str(ds.settings["マイルストーン精度"]),
         "位置合わせ強度": warp_strength,
         "伸縮率上限": max_stretch or "無制限",
         "カーブ復元": recon,
