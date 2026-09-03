@@ -7,6 +7,7 @@
     python main.py --align off                    # 素朴版(位置合わせなし)
     python main.py --group-col 大分類             # 学習粒度を変える
     python main.py --no-validate                  # leave-one-out を省略して高速に
+    python main.py --target PJ-2021-E --phased on # 完了案件で段階予測を確かめる
 
 出力ファイル名には条件が埋め込まれる(設計書 7章)。
     output/forecast_PJ-2026-K_align-on_行程グループ.xlsx
@@ -26,6 +27,7 @@ from src.excel_writer import write_workbook
 from src.forecast import forecast
 from src.learning import (aggregate_actuals, build_project_curves, group_names,
                           learn, project_monthly)
+from src.phased import BASIS_FIXED, BASIS_MODES, BASIS_SCALED, phased_forecast
 from src.timeaxis import RECON_BOX, RECON_MODES, RECON_SMOOTH
 from src.validation import leave_one_out
 
@@ -68,6 +70,12 @@ def parse_args(argv=None):
                         "smooth=累積の単調補間。省略時は settings の カーブ復元")
     p.add_argument("--no-compare-recon", action="store_true",
                    help="検証で復元方式を比較しない(既定は両方式を並べて出す)")
+    p.add_argument("--phased", choices=["auto", "on", "off"], default="auto",
+                   help="段階予測(マイルストーンごとに実績を確定させ、残りを予測)。"
+                        "auto=実績とマイルストーンがある案件では自動で出す")
+    p.add_argument("--remain-basis", choices=["fixed", "scaled"], default=None,
+                   help="段階予測の残工数の決め方。fixed=契約・見積もりの総量を固定して"
+                        "残り=総量-確定分(既定) / scaled=確定分の実績から総量を引き直す")
     p.add_argument("--out", default=None, help="出力Excelのパス")
     p.add_argument("--no-validate", action="store_true", help="leave-one-out を実行しない")
     p.add_argument("--no-cache", action="store_true", help="実績のparquetキャッシュを使わない")
@@ -242,6 +250,43 @@ def _run(argv=None) -> int:
     # 予測対象が進行中なら、同じ月軸・同じ集計で実績を並べて比較できるようにする。
     actual_table = project_monthly(agg, target, fc.months, fc.groups)
 
+    # --- 段階予測 ---
+    # 案件は普通、途中まで進んだ状態で「残りはどうなるか」を問われる。
+    # 完了案件でそれを再現すれば、予測が当たっているかを案件の完了を待たずに測れる。
+    basis = BASIS_SCALED if a.remain_basis == "scaled" else BASIS_FIXED
+    has_actual = actual_table is not None and not actual_table.empty \
+        and float(actual_table.to_numpy().sum()) > 0
+    has_ms = not ds.milestones_of(target).empty
+    want_phased = a.phased == "on" or (a.phased == "auto" and has_actual and has_ms)
+    phased = None
+    if want_phased:
+        try:
+            phased = phased_forecast(
+                ds, curves, groups, agg, target, align=align, n_bin=n_bin,
+                backbone_spec=backbone_spec, backbone_coverage=coverage,
+                hours_per_mm=hpm, recon=recon, warp_strength=warp_strength,
+                max_stretch=max_stretch, basis=basis,
+                group_totals=est or None, exclude_groups=excl)
+        except ValueError as e:
+            # 段階予測はあくまで検証用の付録。ここで落ちても本体の予測は出す。
+            msg = f"段階予測は作れませんでした: {e}"
+            print(f"[警告] {msg}")
+            warnings.append(msg)
+    elif a.phased == "auto" and not (has_actual and has_ms):
+        lack = "実績" if not has_actual else "マイルストーン"
+        print(f"        段階予測  {target} には{lack}が無いため出力しない"
+              "(--phased on で強制)")
+
+    if phased is not None:
+        print(f"        段階予測  {len(phased.stages)} 段階 / 残工数の決め方: {basis}")
+        for _, r in phased.metrics.iterrows():
+            w = r["残り月次WAPE"]
+            print(f"    段階{int(r['段階'])} {str(r['区切り']):<12} "
+                  f"確定 {int(r['確定月数']):>2}ヶ月 → 残り {int(r['残り月数']):>2}ヶ月  "
+                  f"月次WAPE {w if w is None else f'{w:.3f}'}   "
+                  f"残り総量誤差 {r['残り総量誤差(%)']:+.1f}%")
+        warnings.extend(phased.warnings)
+
     # --- 検証 ---
     if a.no_validate:
         import pandas as pd
@@ -287,6 +332,8 @@ def _run(argv=None) -> int:
         "総量の根拠": src,
         "予測した行程グループ": ", ".join(fc.groups),
         "除外した行程グループ": ", ".join(dropped) or "(なし)",
+        "段階予測": (f"{len(phased.stages)} 段階 / 残工数の決め方: {phased.basis}"
+                     if phased is not None else "(出力なし)"),
         "実装範囲": "実装順序 1〜2(素朴版 + マイルストーン位置合わせ) + 見積もりによる総量指定",
         "未使用パラメータ": f"k={ds.settings['k']}, タグ重み係数={ds.settings['タグ重み係数']} "
                             f"(実装順序 3・4 で使用予定)",
@@ -294,7 +341,8 @@ def _run(argv=None) -> int:
 
     write_workbook(out, fc=fc, model=model, model_naive=model_naive, curves=curves,
                    ds=ds, detail=detail, monthly=monthly, summary=summary,
-                   params=params, warnings=warnings, actual_table=actual_table)
+                   params=params, warnings=warnings, actual_table=actual_table,
+                   phased=phased)
 
     print(f"出力: {out}")
     print(f"所要: {time.time() - t0:.1f} 秒")

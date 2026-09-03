@@ -2,10 +2,11 @@
 Excel 出力(設計書 7章)
 
 シート構成
-  予測   月 × 行程グループ の表(主役) + 積み上げグラフ
-  カーブ  学習した平均カーブと各案件のカーブの重ね描き
-  検証   leave-one-out の結果
-  条件   使用パラメータ、依拠した案件、換算係数
+  予測     月 × 行程グループ の表(主役) + 積み上げグラフ
+  段階予測  マイルストーンごとに実績を確定させた予測と実績の重ね描き
+  カーブ    学習した平均カーブと各案件のカーブの重ね描き
+  検証     leave-one-out の結果
+  条件     使用パラメータ、依拠した案件、換算係数
 
 出力方針
   - 合計は数式(SUM)で書く。値を疑ったとき、その場で検算できる状態を保つ。
@@ -361,6 +362,148 @@ def _sheet_forecast(wb, fc, model, ds, cond_ref: str, actual_table=None):
 
 
 # ===========================================================================
+# 段階予測シート
+# ===========================================================================
+def _sheet_phased(wb, ph):
+    """マイルストーンごとに実績を確定させた予測を、実績と重ねて並べる。
+
+    見たいのは1本の予測が当たったかどうかではなく、
+    「確定した実績が増えるほど予測が実績へ寄っていくか」である。
+    寄っていくなら予測は情報を使えている。段階0(着手前)から動かない、
+    あるいは段階が進むほど離れるなら、そのカーブは形を当てていない。
+    """
+    ws = wb.create_sheet("段階予測")
+    months = ph.months
+    r = 1
+    r = _title(ws, r, f"段階予測  {ph.name}  ({ph.pid})")
+    r = _note(ws, r, "マイルストーンを区切りに、そこまでの実績を確定値として置き、"
+                     "残りを学習カーブで予測している。確定分は実績そのものなので、"
+                     "各系列は確定した月までは実績の線と重なる。")
+    r = _note(ws, r, f"残工数の決め方: {ph.basis}  /  "
+                     "学習は対象案件を除いた完了案件のみ(自分の実績で自分を予測しないため)")
+    if ph.eval_last < len(months) - 1:
+        r = _note(ws, r, f"この案件の実績は {months[ph.eval_last]} まで"
+                         f"(契約期間は {months[-1]} まで)。その先は答え合わせに使える実績が"
+                         "無いため、実績の線はそこで止まり、誤差もそこまでで計算している。")
+    r += 1
+
+    # --- 月次の重ね描き(実績 + 各段階) ---
+    r = _title(ws, r, "■ 月次工数(時間)  実績 と 各段階の予測", H2_FONT)
+    ser = ph.series
+    r_next, head, last = _table(
+        ws, r, ser, index_header="月",
+        num_fmt={c: "#,##0" for c in ser.columns},
+        col_width={"月": 10} | {c: 22 for c in ser.columns})
+
+    ln = LineChart()
+    ln.title = f"{ph.name} 月次工数 実績 vs 段階予測(時間)"
+    ln.y_axis.title, ln.x_axis.title = "時間", "月"
+    ln.height, ln.width = 12, min(40, 10 + 0.55 * len(months))
+    ln.add_data(Reference(ws, min_col=2, max_col=1 + len(ser.columns),
+                          min_row=head, max_row=last), titles_from_data=True)
+    ln.set_categories(Reference(ws, min_col=1, min_row=head + 1, max_row=last))
+    for i, sr in enumerate(ln.series):
+        sr.smooth = False
+        if i == 0:            # 実績。太い基準線にして、予測の束と見分けられるようにする
+            sr.graphicalProperties.line.width = 28000
+            sr.graphicalProperties.line.solidFill = "C00000"
+    ws.add_chart(ln, f"{get_column_letter(len(ser.columns) + 3)}{head}")
+    r = r_next + 22
+
+    # --- 累積の重ね描き ---
+    r = _title(ws, r, "■ 累積工数(時間)  実績 と 各段階の予測", H2_FONT)
+    r = _note(ws, r, "月次は上下に振れるため、当たり外れは累積で見るほうが分かりやすい。"
+                     "終点の高さの差がそのまま総量の読み違いになる。")
+    cum_head = r
+    for j, lab in enumerate(["月"] + list(ser.columns)):
+        c = ws.cell(row=cum_head, column=1 + j, value=lab)
+        c.fill, c.font, c.border = HEAD_FILL, HEAD_FONT, BOX
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+    for i in range(len(months)):
+        rr = cum_head + 1 + i
+        src = head + 1 + i
+        c = ws.cell(row=rr, column=1, value=f"=A{src}")
+        c.font, c.border = BODY_FONT, BOX
+        for j in range(len(ser.columns)):
+            L = get_column_letter(2 + j)
+            c = ws.cell(row=rr, column=2 + j)
+            c.font, c.border = BODY_FONT, BOX
+            # 実績が途切れている先の累積は、平らな線になって「消化が止まった」と読めてしまう。
+            # 実績が無いだけなので、こちらも空欄にする。
+            if j == 0 and i > ph.eval_last:
+                continue
+            c.value = f"=SUM({L}${head + 1}:{L}{src})"
+            c.number_format = "#,##0"
+    cum_last = cum_head + len(months)
+
+    lnc = LineChart()
+    lnc.title = "累積工数 実績 vs 段階予測(時間)"
+    lnc.y_axis.title, lnc.x_axis.title = "累積時間", "月"
+    lnc.height, lnc.width = 12, min(40, 10 + 0.55 * len(months))
+    lnc.add_data(Reference(ws, min_col=2, max_col=1 + len(ser.columns),
+                           min_row=cum_head, max_row=cum_last), titles_from_data=True)
+    lnc.set_categories(Reference(ws, min_col=1, min_row=cum_head + 1, max_row=cum_last))
+    for i, sr in enumerate(lnc.series):
+        sr.smooth = False
+        if i == 0:
+            sr.graphicalProperties.line.width = 28000
+            sr.graphicalProperties.line.solidFill = "C00000"
+    ws.add_chart(lnc, f"{get_column_letter(len(ser.columns) + 3)}{cum_head}")
+    r = cum_last + 24
+
+    # --- 段階ごとの当たり外れ ---
+    r = _title(ws, r, "■ 段階ごとの誤差(評価するのは まだ確定していない区間だけ)", H2_FONT)
+    r = _note(ws, r, "確定分は実績そのもので誤差0のため、混ぜると段階が進むほど自動的に"
+                     "数字が良くなる。それでは予測が良くなったのか確定が増えただけなのか"
+                     "区別できないので、残り区間だけで測っている。")
+    r = _note(ws, r, "終盤の段階ほど残り区間は短く、量も小さい。誤差率はその小さい分母で"
+                     "割った値なので数字が跳ねやすい。「残りが全体に占める割合」を見て、"
+                     "どれだけの量に対する誤差なのかと併せて読むこと。")
+    met = ph.metrics
+    r_next, mhead, mlast = _table(
+        ws, r, met, index_header=None,
+        num_fmt={"見込んだ総工数(時間)": "#,##0", "残り実績(時間)": "#,##0",
+                 "残り予測(時間)": "#,##0", "残り総量誤差(%)": "0.0",
+                 "評価した月数": "0",
+                 "残りが全体に占める割合(%)": "0.0",
+                 "残り月次WAPE": "0.000", "累積カーブ最大乖離": "0.000",
+                 "総量誤差(%)": "0.0"},
+        col_width={"段階": 6, "区切り": 16, "確定した月": 12, "確定月数": 9,
+                   "見込んだ総工数(時間)": 18, "残り月数": 9, "評価した月数": 11,
+                   "残り実績(時間)": 15,
+                   "残り予測(時間)": 15, "残りが全体に占める割合(%)": 17,
+                   "残り総量誤差(%)": 15, "残り月次WAPE": 14,
+                   "残りピーク月ズレ": 15, "累積カーブ最大乖離": 17, "総量誤差(%)": 13})
+
+    wape_col = list(met.columns).index("残り月次WAPE") + 1
+    ch = BarChart()
+    ch.type, ch.grouping = "col", "clustered"
+    ch.title = "残り区間の月次誤差WAPE(小さいほど良い)"
+    ch.y_axis.title, ch.x_axis.title = "WAPE", "段階"
+    ch.height, ch.width = 9, 18
+    ch.add_data(Reference(ws, min_col=wape_col, min_row=mhead, max_row=mlast),
+                titles_from_data=True)
+    ch.set_categories(Reference(ws, min_col=2, min_row=mhead + 1, max_row=mlast))
+    ws.add_chart(ch, f"{get_column_letter(len(met.columns) + 2)}{mhead}")
+    r = r_next + 20
+
+    # --- 各段階の但し書き ---
+    r = _title(ws, r, "■ 各段階の条件", H2_FONT)
+    for st in ph.stages:
+        c = ws.cell(row=r, column=1, value=st.label)
+        c.font = Font(name=FONT, size=10, bold=True)
+        r += 1
+        for n in st.notes:
+            r = _note(ws, r, "  ・" + n)
+        r += 1
+    for w in ph.warnings:
+        r = _note(ws, r, "※ " + w)
+
+    ws.freeze_panes = "B" + str(head + 1)
+    return ws
+
+
+# ===========================================================================
 # カーブシート
 # ===========================================================================
 def _sheet_curves(wb, model, model_naive, curves, ds):
@@ -640,10 +783,12 @@ def _page_setup(ws):
 
 def write_workbook(path: str, *, fc, model, model_naive, curves, ds,
                    detail, monthly, summary, params: dict, warnings: list[str],
-                   actual_table=None):
+                   actual_table=None, phased=None):
     wb = Workbook()
     wb.remove(wb.active)
     _sheet_forecast(wb, fc, model, ds, "条件", actual_table=actual_table)
+    if phased is not None:
+        _sheet_phased(wb, phased)
     _sheet_curves(wb, model, model_naive, curves, ds)
     if not summary.empty:
         _sheet_validation(wb, detail, monthly, summary)
