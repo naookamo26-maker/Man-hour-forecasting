@@ -174,6 +174,12 @@ def load_all(master_path: str, actuals_path: str,
         projects[c] = projects[c].apply(_to_month_str)
     if "ステータス" not in projects.columns:
         projects["ステータス"] = "完了"
+    # 学習に使うかどうかがこの列で決まるようになったため、表記を揃えておく。
+    # 空欄は「完了」とみなす(列そのものが無い場合と同じ扱い)。
+    # astype(str) は欠損を欠損のまま残す(pandas 3 の str dtype)ので、
+    # 文字列 "nan" を置換するのではなく fillna で埋める。
+    projects["ステータス"] = (projects["ステータス"].astype(str).str.strip()
+                              .fillna("完了").replace({"": "完了"}))
     if "タグ" not in projects.columns:
         projects["タグ"] = ""
     projects["タグ"] = projects["タグ"].fillna("")
