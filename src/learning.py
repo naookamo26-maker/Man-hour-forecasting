@@ -327,6 +327,8 @@ class Model:
     project_shapes: dict[str, np.ndarray] = field(default_factory=dict)  # カーブシート用
     hours_per_mm: float = 160.0
     recon: str = RECON_BOX     # 月次から月内分布を復元する方式
+    warp_strength: float = 1.0     # 位置合わせの強さ(0=なし / 1=実位置ちょうど)
+    max_stretch: float | None = None   # 区間ごとの伸縮率の上限。跳ねの高さの上限になる
     group_sample_n: dict[str, int] = field(default_factory=dict)
     # 行程グループ -> その形状カーブの学習に参加した案件数。
     # そのグループの業務が一切ない案件は形状の平均に参加しないため、
@@ -365,11 +367,17 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
           backbone_coverage: float = 0.6,
           weights: dict[str, float] | None = None,
           hours_per_mm: float = 160.0,
-          recon: str = RECON_BOX) -> Model:
+          recon: str = RECON_BOX,
+          warp_strength: float = 1.0,
+          max_stretch: float | None = None) -> Model:
     """案件カーブ群から予測モデルを学習する。
 
     align=False なら素朴版(経過期間比のまま単純平均)、
     align=True ならマイルストーンで位置を揃えてから平均する。
+
+    warp_strength / max_stretch は位置合わせの効かせ具合。
+    学習と予測で同じ値を使わないと、貼り付ける座標系が学習時とずれるため、
+    ここで受け取った値を Model に載せて forecast() へ引き渡す。
     """
     if not curves:
         raise ValueError("学習に使える案件がありません。")
@@ -387,7 +395,7 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
     for c in curves.values():
         if backbone:
             pairs = [(nm, canonical_anchor[nm], c.ms_t[nm]) for nm in backbone if nm in c.ms_t]
-            c.warp = Warp.build(pairs)
+            c.warp = Warp.build(pairs, strength=warp_strength, max_stretch=max_stretch)
         else:
             c.warp = Warp.identity()
 
@@ -468,7 +476,7 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
                  ms_stats=ms_stats, backbone=backbone, canonical_anchor=canonical_anchor,
                  contributors=contributors, align=align, project_shapes=project_shapes,
                  hours_per_mm=hours_per_mm, group_sample_n=group_sample_n,
-                 recon=recon)
+                 recon=recon, warp_strength=warp_strength, max_stretch=max_stretch)
 
 
 def group_names(agg: pd.DataFrame, phase_map: pd.DataFrame, group_col: str) -> list[str]:

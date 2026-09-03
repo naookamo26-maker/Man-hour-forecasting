@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import os
 
@@ -138,6 +139,40 @@ SHAPE = {
     "QA・デバッグ":             (6.0, 1.9,  [(0.76, 1.10, 0.045), (0.92, 0.90, 0.03)]),
     "PM・運営":                 (1.7, 1.7,  []),
 }
+
+# ----------------------------------------------------------------------------
+# 2-2. 消化ペースの型
+# ----------------------------------------------------------------------------
+# 実データの工数カーブは「中央に大きな山が1つ」ばかりではない。
+# 前半が緩やかで後半に一気に消化する案件、早めに片付いて終盤が落ち着く案件、
+# 山が2つに割れる案件が実際に存在する。
+#
+# ここでは「工数の塊をどこへ置くか」を案件ごとに移す形で表現する。
+# pace(s) は工数の位置 s を s' に移す単調増加の写像で、pace(0)=0 / pace(1)=1。
+# 質量そのものは動かさないので、総工数は変わらず形だけが前後に寄る。
+# マイルストーンの位置は動かさないため、
+# 「マイルストーンでは説明できない形のばらつき」がデータに残る。
+# これが無いと位置合わせの効果を過大評価してしまう。
+PACE = {
+    "標準":     lambda s: s,
+    "後半集中": lambda s: s ** 0.72,      # 工数が後ろへ寄る。前半緩やか、後半に一気
+    "前倒し":   lambda s: s ** 1.45,      # 工数が前へ寄る。早めに山、終盤は落ち着く
+    "二山":     lambda s: s - 0.11 * np.sin(2 * np.pi * s),   # 中央から離れ、山が2つに割れる
+}
+# 出現比率。標準が半分、残りを3つで分ける。
+PACE_WEIGHTS = {"標準": 0.46, "後半集中": 0.22, "前倒し": 0.22, "二山": 0.10}
+
+
+def pace_names(n: int, rng) -> list[str]:
+    """案件ごとの消化ペースを、比率どおりに割り当てて返す(順序はシャッフル)。"""
+    names, weights = list(PACE_WEIGHTS), np.array(list(PACE_WEIGHTS.values()))
+    counts = np.maximum(1, np.round(weights / weights.sum() * n).astype(int))
+    out = [nm for nm, c in zip(names, counts) for _ in range(c)][:n]
+    while len(out) < n:
+        out.append("標準")
+    rng.shuffle(out)
+    return out
+
 
 # ----------------------------------------------------------------------------
 # 3. マイルストーン
@@ -273,7 +308,7 @@ def build_member_pool(pid: str, outsourced: bool) -> dict[str, list[tuple]]:
     return pool
 
 
-def generate_project_actuals(row) -> pd.DataFrame:
+def generate_project_actuals(row, pace: str = "標準") -> pd.DataFrame:
     pid, name, ptype, mm, start, end, tags, status = row
     months = month_range(start, end)
     n_month = len(months)
@@ -295,7 +330,10 @@ def generate_project_actuals(row) -> pd.DataFrame:
     # 正準グリッド上で密度を作り、ワープして月次に落とす
     n_grid = 4000
     s_mid = (np.arange(n_grid) + 0.5) / n_grid
-    u_mid = warp(s_mid)
+    # 消化ペース: 各グリッド点が担う工数はそのままに、置く位置だけを移す。
+    # 単調増加で両端を固定しているので、総工数も月数も変わらない。
+    s_placed = np.clip(PACE[pace](s_mid), 0.0, 1.0)
+    u_mid = warp(s_placed)
     bin_idx = np.clip(np.searchsorted(edges, u_mid, side="right") - 1, 0, n_month - 1)
 
     records = []
@@ -376,31 +414,80 @@ def write_sheet(ws, df: pd.DataFrame, widths: dict[str, int] | None = None,
         c.fill = NOTE_FILL
 
 
-def build_master(projects_rows, ms_rows):
+def wide_projects_frame(projects_rows, ms_rows, precision: str = "月") -> pd.DataFrame:
+    """案件行 + マイルストーン列 の横持ち表を作る。
+
+    マイルストーン名は見出し行に1回だけ現れるので、表記の揺れが起きない。
+    空欄は「未記入」を表し、どの案件に何が入っているかがシート上で一目で分かる。
+    同じマイルストーンが複数回ある案件は、1つのセルにカンマ区切りで並べる
+    (「2020-04, 2020-08」)。列は増やさない。
+
+    precision  "月" なら 2020-08、"日" なら 2020-08-22 と書き出す。
+               既定は月。settings の マイルストーン精度 の既定が 月 で、
+               日まで書いても月央に丸められるため、シートの見た目と
+               実際に使われる値を一致させておく。
+    """
+    fmt = "%Y-%m" if precision == "月" else "%Y-%m-%d"
+    base = ["案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"]
+    df = pd.DataFrame(projects_rows, columns=base)
+    ms = pd.DataFrame(ms_rows, columns=["案件ID", "マイルストーン名", "日付"])
+    if ms.empty:
+        return df
+
+    # 列の並びは、案件をまたいだ平均の位置(経過期間比)順にする。
+    span = {}
+    for _, r in df.iterrows():
+        st = pd.Period(str(r["開始"]), freq="M").start_time
+        en = pd.Period(str(r["終了"]), freq="M").end_time
+        span[str(r["案件ID"])] = (st, max((en - st).days, 1))
+    ms["日付"] = pd.to_datetime(ms["日付"])
+    ms["位置"] = [((d - span[p][0]).days / span[p][1]) if p in span else 0.5
+                  for p, d in zip(ms["案件ID"].astype(str), ms["日付"])]
+    order = ms.groupby("マイルストーン名")["位置"].mean().sort_values().index.tolist()
+
+    cells: dict[tuple[str, str], list] = {}
+    for (pid, nm), sub in ms.groupby(["案件ID", "マイルストーン名"]):
+        cells[(str(pid), nm)] = sorted(sub["日付"].tolist())
+
+    for nm in order:
+        df[nm] = [", ".join(sorted({d.strftime(fmt) for d in cells.get((pid, nm), [])})) or None
+                  for pid in df["案件ID"].astype(str)]
+    return df
+
+
+def build_master(projects_rows, ms_rows, precision: str = "月"):
     wb = Workbook()
 
     # --- projects ---
     ws = wb.active
     ws.title = "projects"
-    dfp = pd.DataFrame(projects_rows, columns=[
-        "案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"])
+    dfp = wide_projects_frame(projects_rows, ms_rows, precision)
+    base = {"案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"}
     write_sheet(ws, dfp,
                 widths={"案件ID": 14, "名称": 30, "種別": 20, "契約人月": 12,
                         "開始": 10, "終了": 10, "タグ": 40, "ステータス": 12},
-                input_cols={"契約人月", "開始", "終了", "タグ", "ステータス"},
-                note="【凡例】青字セルが手入力項目。タグは ; 区切りで複数指定可。"
-                     "ステータス=予測対象 の案件が予測の対象になる(実績CSVに行が無くてよい)。"
-                     "種別は必須・排他、タグは任意。")
+                input_cols=({"契約人月", "開始", "終了", "タグ", "ステータス"}
+                            | {c for c in dfp.columns if c not in base}),
+                note="【凡例】青字セルが手入力項目。ステータス=予測対象 の案件が予測の対象になる"
+                     "(実績CSVに行が無くてよい)。"
+                     "ステータス列より右はマイルストーン列で、見出しがマイルストーン名、"
+                     "セルが日付(YYYY-MM-DD)。空欄=未記入で、記入が無くても動作する(設計書 3-2)。"
+                     "同じマイルストーンを一度で通過できず複数回訪れた場合は、"
+                     "同じセルにカンマ区切りで並べる(例: 2020-04, 2020-08)。列は増やさない。"
+                     "最終回を工程の境目、初回を「α版(初回)」という別のマイルストーンとして扱う。")
 
-    # --- milestones ---
-    ws = wb.create_sheet("milestones")
-    dfm = pd.DataFrame(ms_rows, columns=["案件ID", "マイルストーン名", "日付"])
-    write_sheet(ws, dfm,
-                widths={"案件ID": 14, "マイルストーン名": 20, "日付": 14},
-                input_cols={"マイルストーン名", "日付"},
-                note="【凡例】青字セルが手入力項目。日付は YYYY-MM-DD。"
-                     "行が無い案件・無いマイルストーンがあっても動作する(設計書 3-2)。"
-                     "予測対象案件に行を書くと、その点は実測値として固定され前後は学習カーブで内挿される。")
+    # --- estimates ---
+    # 着手前の案件は実績が1行も無く、分かっているのは要素別の見積もりだけになる。
+    # その入力口として空のシートを用意しておく(1行も無ければ契約人月から配分する)。
+    ws = wb.create_sheet("estimates")
+    write_sheet(ws, pd.DataFrame(columns=["案件ID", "行程グループ", "見積人月"]),
+                widths={"案件ID": 14, "行程グループ": 26, "見積人月": 12},
+                input_cols={"案件ID", "行程グループ", "見積人月"},
+                note="【凡例】着手前の案件は実績が無く、要素別の見積もりだけが分かっている。"
+                     "ここに 行程グループ ごとの見積人月を入れると、"
+                     "その値がそのままグループ別の総量になる(設計書 6 Step1)。"
+                     "行を書かなかった行程グループは『この案件では行わない業務』として"
+                     "予測から除外される。1行も無ければ 契約人月 × 学習した工数比率 で配分する。")
 
     # --- phase_map ---
     ws = wb.create_sheet("phase_map")
@@ -424,6 +511,9 @@ def build_master(projects_rows, ms_rows):
         ("位置合わせ", "ON", "ON/OFF。マイルストーンによる landmark registration(設計書 5 Step3)"),
         ("背骨マイルストーン", "自動", "位置合わせに使うマイルストーン名を ; 区切りで指定。自動=全案件共通のものを使う"),
         ("背骨最小カバー率", 0.6, "この割合以上の案件が持つマイルストーンを背骨に採用する。1.0=全案件必須"),
+        ("マイルストーン精度", "月", "月 / 自動。既定の 月 は日付を月央に丸める。自動 は日まで書いた日付をそのまま使う"),
+        ("位置合わせ強度", 1.0, "0〜1。実位置を正準位置へ引き戻す割合。下げると時間軸の伸縮が緩み、工数の跳ねが減る"),
+        ("伸縮率上限", 0, "時間軸の伸縮率の上限(倍)。例 1.5。0=無制限。跳ねの高さに直接上限をかける"),
         ("マイルストーン最小件数", 3, "この件数未満の統計は参考値として警告する(設計書 11)"),
         ("カーブ解像度", 100, "正準時間軸の分割数。学習カーブのビン数"),
         ("k", 3, "種別重み w=n/(n+k)。第1版では未使用。実装順序 3 で使用する"),
@@ -440,14 +530,27 @@ def build_master(projects_rows, ms_rows):
 
 # ============================================================================
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date-precision", choices=["月", "日"], default="月",
+                    help="マイルストーン日付の書き方。既定は 月(settings の既定に合わせる)")
+    args = ap.parse_args()
     os.makedirs(DATA_DIR, exist_ok=True)
 
     all_actuals = []
     ms_rows = []
     summary = []
+    project_rows = []
+
+    done = [r for r in PROJECTS if r[7] != "予測対象"]
+    paces = dict(zip([r[0] for r in done], pace_names(len(done), RNG)))
 
     for row in PROJECTS:
         pid, name, ptype, mm, start, end, tags, status = row
+        pace = paces.get(pid, "標準")
+        # 消化ペースは名称に括弧書きで残す。どの案件がどの形かを見て確かめられるようにする。
+        name = name if status == "予測対象" or pace == "標準" else f"{name}({pace})"
+        row = (pid, name, ptype, mm, start, end, tags, status)
+        project_rows.append(row)
         months = month_range(start, end)
 
         if status == "予測対象":
@@ -458,19 +561,19 @@ def main():
             summary.append((pid, name, ptype, mm, len(months), 0, "予測対象"))
             continue
 
-        df, ms_pos, months, edges = generate_project_actuals(row)
+        df, ms_pos, months, edges = generate_project_actuals(row, pace)
         all_actuals.append(df)
         for msname in MS_BY_TYPE[ptype]:
             ms_rows.append((pid, msname, t_to_date(months, ms_pos[msname])))
         summary.append((pid, name, ptype, mm, len(months), len(df),
-                        f"{df['時間'].sum() / HOURS_PER_MM:.0f}人月"))
+                        f"{df['時間'].sum() / HOURS_PER_MM:.0f}人月 / 消化ペース {pace}"))
 
     actuals = pd.concat(all_actuals, ignore_index=True)
     actuals = actuals.sort_values(["案件ID", "月", "行程", "メンバー"]).reset_index(drop=True)
     out_csv = os.path.join(DATA_DIR, "actuals.csv")
     actuals.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    wb = build_master(PROJECTS, ms_rows)
+    wb = build_master(project_rows, ms_rows, args.date_precision)
     out_xlsx = os.path.join(DATA_DIR, "master.xlsx")
     wb.save(out_xlsx)
 

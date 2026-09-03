@@ -64,6 +64,7 @@ def leave_one_out(ds, curves: dict[str, ProjectCurve], groups: list[str], *,
                   n_bin: int = 100, backbone_spec: str = "自動",
                   backbone_coverage: float = 0.6, hours_per_mm: float = 160.0,
                   modes=MODES,
+                  warp_strength: float = 1.0, max_stretch: float | None = None,
                   recons=(RECON_BOX,)) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """leave-one-out を実行する。
 
@@ -91,7 +92,8 @@ def leave_one_out(ds, curves: dict[str, ProjectCurve], groups: list[str], *,
             model = learn(rest, groups, align=align, n_bin=n_bin,
                           backbone_spec=backbone_spec,
                           backbone_coverage=backbone_coverage,
-                          hours_per_mm=hours_per_mm, recon=recon)
+                          hours_per_mm=hours_per_mm, recon=recon,
+                          warp_strength=warp_strength, max_stretch=max_stretch)
             fc = forecast(model, ds, held, use_given_milestones=use_given,
                           months_override=curves[held].months)
 

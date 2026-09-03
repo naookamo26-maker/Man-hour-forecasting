@@ -10,6 +10,7 @@ Excel/CSV というファイル形式の存在を知らない。
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -26,12 +27,41 @@ CACHE_SCHEMA_VERSION = "v3"
 # 全角の数字・小数点・桁区切りを半角に変換してから数値パースする。
 _ZEN_DIGITS = str.maketrans("０１２３４５６７８９．，", "0123456789.,")
 
+# projects シートの固定列。これ以外の列はすべてマイルストーン列として読む。
+# 「プロジェクト情報の右にマイルストーンを足していく」入力形式の土台になる。
+PROJECT_BASE_COLS = ("案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス")
+
+# 同じマイルストーンが複数回あるときは、1つのセルにカンマ区切りで並べて書く。
+#   α版 の列に  2020-04-18, 2020-08-22, 2021-01-12
+# 列を増やす方式は、記入する列を間違える・列を足し忘れるといった事故が起きるため使わない。
+_DATE_SEPARATORS = re.compile(r"[,、;；\n\r]+")
+
+# 月までの表記。開始・終了と同じ粒度で書けるようにする。
+#   2020-08 / 2020/8 / 2020年8月
+# 月表記はその月の中央として扱う。月初として扱うと、実際の日付が月内に散っている分
+# だけ全部のマイルストーンが半月ぶん前へずれ、系統的な誤差になる(README の実測参照)。
+_MONTH_ONLY = re.compile(r"^\s*(\d{4})\s*[-/年.]\s*(\d{1,2})\s*月?\s*$")
+
+# 見出しが重複したときの後始末。
+# 利用者が同じ見出しを2つ作ってしまうと pandas が α版.1 のように直すので、
+# その分は同じマイルストーンとして読み直す(セルを移し替えさせない)。
+_PANDAS_DEDUP_SUFFIX = re.compile(r"\.\d+$")
+_REPEAT_SUFFIX = re.compile(
+    r"(?:\s*[#＃]\s*\d+|\s*[（(]\s*\d+\s*回目\s*[)）])\s*$")
+
+# 同じマイルストーンが複数回あったとき、初回に付ける接尾辞。
+# 「レビューに入った日」と「通過した日」は別の意味を持つので、別のマイルストーンとして扱う。
+FIRST_ATTEMPT_SUFFIX = "(初回)"
+
 DEFAULT_SETTINGS = {
     "人月換算係数": 160.0,
     "集約軸": "行程グループ",
     "位置合わせ": "ON",
     "背骨マイルストーン": "自動",
     "背骨最小カバー率": 0.6,
+    "マイルストーン精度": "月",
+    "位置合わせ強度": 1.0,
+    "伸縮率上限": 0.0,
     "マイルストーン最小件数": 3,
     "行程グループ最小件数": 3,
     "カーブ解像度": 100,
@@ -53,6 +83,11 @@ class Dataset:
     estimates: pd.DataFrame = field(default_factory=pd.DataFrame)
     # 案件ID / 行程グループ / 見積人月。これから着手する案件は実績が1行も無く、
     # 分かっているのは要素別の見積もりだけになる。その入力口(設計書 6 Step1)。
+    ms_attempts: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # 案件ID / マイルストーン名 / 回数 / 初回 / 最終。
+    # 同じマイルストーンを複数回通過した(= 一度で通らずやり直した)案件の記録。
+    # 位置合わせのアンカーには最終回だけを使うが、回数そのものは
+    # 「その案件が難航した」という情報なので捨てずに残す。
     source: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
     # 読み込み〜学習の途中で気づいた注意点をここに溜め、出力Excelの「条件」シートに載せる。
@@ -156,6 +191,183 @@ def _read_settings(path: str) -> dict:
     return out
 
 
+def month_center(month) -> pd.Timestamp:
+    """月をその月の中央の時点として返す。
+
+    月までしか分からないマイルストーンを時間軸上の1点に置くとき、
+    月初に置くと実際の日付が月内に散っているぶんだけ半月ぶん前へ寄る。
+    全案件で同じ向きにずれるので、これは平均で消えない系統誤差になる。
+    月央なら、月内で一様に散っていると仮定したときのずれが期待値ゼロになる。
+    """
+    p = pd.Period(str(month)[:7], freq="M")
+    return p.start_time + (p.end_time - p.start_time) / 2
+
+
+def _parse_dates_cell(v) -> list[pd.Timestamp]:
+    """1セルの値を日付のリストにする。
+
+    通常は1つ。同じマイルストーンを複数回通過した案件では、
+    カンマ区切りで並べて書く(「2020-04-18, 2020-08-22」)。
+    区切りはカンマ・読点・セミコロン・改行を受け付ける。
+    日付そのものが 2020/4/18 のようにスラッシュを含むため、
+    スラッシュは区切りにしない。
+
+    開始・終了と同じ「2020-08」という月までの表記も書ける。その場合は月央として扱う。
+    """
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return []
+    if isinstance(v, (pd.Timestamp, dt.datetime, dt.date)):
+        return [pd.Timestamp(v)]
+    parts = [p.strip() for p in _DATE_SEPARATORS.split(str(v)) if p.strip()]
+    out = []
+    for p in parts:
+        m = _MONTH_ONLY.match(p)
+        if m:
+            # 13月のような値は月表記として成立しないので、読めない値として扱う。
+            try:
+                out.append(month_center(f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"))
+            except Exception:
+                out.append(None)
+            continue
+        d = pd.to_datetime(p, errors="coerce")
+        out.append(d if pd.notna(d) else None)
+    return out
+
+
+def _base_milestone_name(col: str, all_cols: list[str]) -> str:
+    """マイルストーン列の見出しから、繰り返し回数の接尾辞を落として本来の名前を返す。
+
+    通常はそのまま。「α版#2」「α版(2回目)」のように書かれていれば「α版」に戻す。
+    「α版.1」は pandas が重複見出しを機械的に直した形なので、
+    接尾辞を落とした名前が同じシートに実在するときだけ落とす。
+    「ver1.5」のような、本当に数字で終わる名前を壊さないための条件。
+    """
+    name = str(col).strip()
+    stripped = _REPEAT_SUFFIX.sub("", name).strip()
+    if stripped and stripped != name:
+        return stripped
+    dedup = _PANDAS_DEDUP_SUFFIX.sub("", name).strip()
+    if dedup and dedup != name and dedup in {str(c).strip() for c in all_cols}:
+        return dedup
+    return name
+
+
+def _milestones_from_projects(projects: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """projects シートの横持ちマイルストーン列を縦持ちに開く。
+
+    案件情報の右にマイルストーンを列として並べ、見出し行をマイルストーン名にする形式。
+    別シートに分けるのと比べて、
+
+      - マイルストーン名が見出し行で1回決まるので、表記の揺れが起きない
+      - どの案件に何が記入済みかが、シートを見るだけで分かる
+      - 案件1行を書けば入力が終わる(シート間を往復しない)
+
+    固定列(PROJECT_BASE_COLS)以外の列をマイルストーン列とみなす。
+    ただしメモ欄などを誤って取り込まないよう、
+    日付として読める値が1つも無い列は無視する。
+
+    戻り値: (マイルストーン列を除いた projects, 縦持ちマイルストーン, 警告)
+    """
+    warnings: list[str] = []
+    extra = [c for c in projects.columns if str(c).strip() not in PROJECT_BASE_COLS]
+    if not extra:
+        return projects, pd.DataFrame(columns=["案件ID", "マイルストーン名", "日付"]), warnings
+
+    rows, ms_cols, ignored = [], [], []
+    pids = projects["案件ID"].astype(str).str.strip().tolist()
+    for col in extra:
+        parsed = [_parse_dates_cell(v) for v in projects[col]]
+        if not any(any(d is not None for d in lst) for lst in parsed):
+            ignored.append(str(col))
+            continue
+        ms_cols.append(col)
+        name = _base_milestone_name(col, list(projects.columns))
+        bad = [(pid, projects[col].iloc[i]) for i, (pid, lst) in enumerate(zip(pids, parsed))
+               if any(d is None for d in lst)]
+        if bad:
+            shown = ", ".join(f"{pid}({v!r})" for pid, v in bad[:5])
+            warnings.append(
+                f"projects シートの「{col}」列に日付として読めない値があり、その値だけ"
+                f"無視しました: {shown}" + (" ほか" if len(bad) > 5 else "")
+                + "。複数回あるマイルストーンはカンマ区切りで書くこと(例: 2020-04-18, 2020-08-22)。")
+        for pid, lst in zip(pids, parsed):
+            for d in lst:
+                if d is not None:
+                    rows.append({"案件ID": pid, "マイルストーン名": name, "日付": d})
+
+    if ignored:
+        warnings.append(
+            f"projects シートの次の列は日付が1つも入っていないため、"
+            f"マイルストーン列として読みませんでした: {', '.join(ignored)}。"
+            "マイルストーン列なら日付を入れること。メモ欄ならこのままで問題ありません。")
+
+    keep = [c for c in projects.columns if c not in ms_cols]
+    return projects[keep].copy(), pd.DataFrame(
+        rows, columns=["案件ID", "マイルストーン名", "日付"]), warnings
+
+
+def _normalize_milestone_repeats(ms: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """同じマイルストーンが同じ案件に複数回あるケースを整理する。
+
+    マイルストーンは「このまま進めてよいか」を判断する機会でもあるので、
+    通過できずにやり直し、同じ名前のマイルストーンが2回・3回と訪れることがある。
+
+    時間軸の位置合わせに使うアンカーは、案件ごとに1つの名前につき1点でなければならない
+    (2点あるとワープが一対一でなくなり、逆変換が壊れる)。そこで意味で切り分ける。
+
+        最終回 -> 「α版」        その工程を実際に抜けた日。工程の境目はここ。
+        初回   -> 「α版(初回)」  レビューに入った日。ここから最終回までが手戻り期間。
+        中間   -> 使わない        3回目以降の中間はアンカーとして意味が定まらない
+
+    初回を別のマイルストーンとして残すのが要点で、
+    「α版(初回)」と「α版」の間隔がそのまま手戻り期間の長さになり、
+    そこに工数が積み上がる形を学習カーブが自然に持てる。
+    背骨に採用するかどうかは、他のマイルストーンと同じくカバー率が決める。
+
+    利用者が自分で「α版(初回)」列を作っている場合はそちらを正とし、上書きしない。
+    """
+    cols = ["案件ID", "マイルストーン名", "日付"]
+    empty_att = pd.DataFrame(columns=["案件ID", "マイルストーン名", "回数", "初回", "最終"])
+    if ms.empty:
+        return ms.reindex(columns=cols), empty_att, []
+
+    ms = ms.dropna(subset=["日付"]).sort_values(["案件ID", "マイルストーン名", "日付"])
+    existing = set(zip(ms["案件ID"], ms["マイルストーン名"]))
+    out, att, warnings = [], [], []
+
+    for (pid, name), sub in ms.groupby(["案件ID", "マイルストーン名"], sort=False):
+        dates = sub["日付"].tolist()
+        if len(dates) == 1:
+            out.append({"案件ID": pid, "マイルストーン名": name, "日付": dates[0]})
+            continue
+        out.append({"案件ID": pid, "マイルストーン名": name, "日付": dates[-1]})
+        first_name = f"{name}{FIRST_ATTEMPT_SUFFIX}"
+        if (pid, first_name) not in existing:
+            out.append({"案件ID": pid, "マイルストーン名": first_name, "日付": dates[0]})
+        att.append({"案件ID": pid, "マイルストーン名": name, "回数": len(dates),
+                    "初回": dates[0], "最終": dates[-1]})
+
+    attempts = pd.DataFrame(att, columns=["案件ID", "マイルストーン名", "回数", "初回", "最終"])
+    if not attempts.empty:
+        n_pj = attempts["案件ID"].nunique()
+        warnings.append(
+            f"同じマイルストーンが複数回記録されている案件が {n_pj} 件あります。"
+            f"位置合わせのアンカーには最終回(= 実際に通過した日)を使い、"
+            f"初回は「名前{FIRST_ATTEMPT_SUFFIX}」という別のマイルストーンとして扱いました。"
+            "その間隔が手戻り期間になります。")
+        for _, r in attempts.sort_values("回数", ascending=False).head(10).iterrows():
+            span = (r["最終"] - r["初回"]).days
+            warnings.append(
+                f"  {r['案件ID']} {r['マイルストーン名']}: {int(r['回数'])} 回 "
+                f"({r['初回']:%Y-%m-%d} 〜 {r['最終']:%Y-%m-%d} / {span} 日)")
+        if len(attempts) > 10:
+            warnings.append(f"  ほか {len(attempts) - 10} 件")
+
+    return (pd.DataFrame(out, columns=cols)
+            .sort_values(["案件ID", "日付"]).reset_index(drop=True),
+            attempts, warnings)
+
+
 def load_all(master_path: str, actuals_path: str,
              overrides: dict | None = None,
              use_cache: bool = True) -> Dataset:
@@ -184,14 +396,64 @@ def load_all(master_path: str, actuals_path: str,
         projects["タグ"] = ""
     projects["タグ"] = projects["タグ"].fillna("")
 
+    settings = _read_settings(master_path)
+    if overrides:
+        settings.update({k: v for k, v in overrides.items() if v is not None})
+
+    # マイルストーンは projects シートの右側に列として書く形が本命。
+    # 旧形式(別シート)も読めるようにしてあるので、移行の途中でも動く。
+    projects, wide_ms, ms_warnings = _milestones_from_projects(projects)
+
     try:
-        milestones = _read_table(master_path, "milestones")
-        milestones["案件ID"] = milestones["案件ID"].astype(str).str.strip()
-        milestones["マイルストーン名"] = milestones["マイルストーン名"].astype(str).str.strip()
-        milestones["日付"] = pd.to_datetime(milestones["日付"])
+        sheet_ms = _read_table(master_path, "milestones")
+        sheet_ms["案件ID"] = sheet_ms["案件ID"].astype(str).str.strip()
+        sheet_ms["マイルストーン名"] = sheet_ms["マイルストーン名"].astype(str).str.strip()
+        sheet_ms["日付"] = pd.to_datetime(sheet_ms["日付"], errors="coerce")
+        if not wide_ms.empty and not sheet_ms.empty:
+            ms_warnings.append(
+                "projects シートの横持ちマイルストーンと milestones シートの両方に"
+                "記入があります。両方を読み込みましたが、二重管理は表記の揺れの元なので、"
+                "どちらかに寄せること(scripts/migrate_master_wide.py で統合できます)。")
     except ValueError:
-        # マイルストーンシートが無くても動く(設計書 3-2)
-        milestones = pd.DataFrame(columns=["案件ID", "マイルストーン名", "日付"])
+        # マイルストーンが1件も無くても動く(設計書 3-2)
+        sheet_ms = pd.DataFrame(columns=["案件ID", "マイルストーン名", "日付"])
+
+    milestones = pd.concat([wide_ms, sheet_ms], ignore_index=True)
+
+    # 「2020-08」と書いたつもりでも、Excel が勝手に 2020-08-01 という日付に
+    # 変換してしまうことがある。そうなると読み込み側では月表記と区別がつかず、
+    # 全マイルストーンが半月ぶん前に寄ったまま気づけない。
+    # そこで既定は 月 とし、日付の細部を捨てて月央へ揃える。
+    # 実績が月単位である以上、日まで分かっても効果は小さく(完了30件で相対4%、
+    # 統計的にははっきりしない)、月初へ寄る事故のほうが害が大きい(同 12% 悪化)。
+    # 日付が正確に分かっていてその精度を使いたい場合だけ 自動 にする。
+    precision = str(settings.get("マイルストーン精度", "月")).strip() or "月"
+    if precision not in ("自動", "月"):
+        raise ValueError(
+            f"マイルストーン精度 は 自動 / 月 のいずれかで指定してください(指定値: {precision!r})")
+    if precision == "月" and not milestones.empty:
+        keys = ["案件ID", "マイルストーン名", "日付"]
+        before = len(milestones.drop_duplicates(subset=keys))
+        snapped = milestones["日付"].apply(month_center)
+        # 月央そのものでない日付が入っていた = 日まで書かれていた、ということ。
+        # 既定は月精度なのでその細部は使われない。黙って捨てると
+        # 「日まで入力したのに反映されない」の原因が追えなくなる。
+        n_day = int((milestones["日付"] != snapped).sum())
+        milestones["日付"] = snapped
+        after = len(milestones.drop_duplicates(subset=keys))
+        if n_day:
+            ms_warnings.append(
+                f"マイルストーン精度=月 のため、日まで書かれた {n_day} 件の日付を月央に丸めました。"
+                "日の精度をそのまま使いたい場合は settings の マイルストーン精度 を 自動 にすること"
+                "(ただし Excel が「2020-08」を 2020-08-01 に変換していないか要確認)。")
+        if after < before:
+            ms_warnings.append(
+                f"月に丸めた結果、同じ月に入った複数回のマイルストーン {before - after} 件が"
+                "1件にまとまりました。手戻り期間が1ヶ月未満だった分は区別できません。")
+
+    milestones = milestones.drop_duplicates(subset=["案件ID", "マイルストーン名", "日付"])
+    milestones, ms_attempts, repeat_warnings = _normalize_milestone_repeats(milestones)
+    ms_warnings.extend(repeat_warnings)
 
     try:
         estimates = _read_table(master_path, "estimates")
@@ -213,10 +475,6 @@ def load_all(master_path: str, actuals_path: str,
     for c in phase_map.columns:
         phase_map[c] = phase_map[c].astype(str).str.strip()
 
-    settings = _read_settings(master_path)
-    if overrides:
-        settings.update({k: v for k, v in overrides.items() if v is not None})
-
     # 集約軸は settings と overrides の両方で決まるため、確定した後に検証する。
     phase_map, phase_map_warnings = _check_phase_map(phase_map, str(settings["集約軸"]))
 
@@ -229,9 +487,11 @@ def load_all(master_path: str, actuals_path: str,
         settings=settings,
         actuals=actuals,
         estimates=estimates,
+        ms_attempts=ms_attempts,
         source={"master": os.path.abspath(master_path),
                 "actuals": os.path.abspath(actuals_path)},
     )
+    ds.warnings.extend(ms_warnings)
     ds.warnings.extend(phase_map_warnings)
     ds.warnings.extend(actuals_warnings)
     _check_consistency(ds)
