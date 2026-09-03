@@ -65,6 +65,10 @@ class Stage:
     table: pd.DataFrame         # 月 × 行程グループ。確定分は実績、残りは予測
     pred_only: pd.DataFrame     # 残り区間の予測だけ(確定分は 0)
     total_hours: float          # 段階時点で見込んだ案件総工数
+    remain_gain: float          # 残工数 ÷ 学習カーブが残り区間に置く量。
+    # 1.0 なら学習カーブどおり。1 より大きいほど「確定分が学習カーブより少ない」ことを
+    # 意味し、その差が残り区間へ上乗せされる = 切り替え点で工数が跳ねる。
+    # 跳ねの高さはこの倍率そのものなので、グラフの段差を見たらまずここを見る。
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -270,6 +274,19 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
                          actual=actual, basis=basis, group_totals=group_totals,
                          exclude_groups=exclude_groups))
 
+    # 総工数の保存を実行時に確かめる。
+    # 段階の総工数は「見込み総量」と一致しなければならない。
+    # ただし確定分の実績が既にそれを超えている場合は、実績を減らすことはできないので
+    # 確定分そのものが下限になる。ここが崩れるのは配分の実装バグであり、
+    # グラフ上は「マイルストーンの直後に工数が跳ね、合計が契約人月を上回る」形で出る。
+    for st in stages:
+        done = float(st.table.iloc[:st.n_fixed].to_numpy().sum()) if st.n_fixed else 0.0
+        expect = max(stages[0].total_hours, done) if basis == BASIS_FIXED else None
+        if expect is not None and abs(st.total_hours - expect) > max(1e-6, expect * 1e-9):
+            raise AssertionError(
+                f"{pid} {st.label}: 段階の総工数 {st.total_hours:,.1f} が "
+                f"見込み総量 {expect:,.1f} と一致しません(残工数の配分バグ)。")
+
     act_m = actual.sum(axis=1)
     # 実績が無い月を 0 として描くと、グラフ上は「実績が急に落ちた」ように見える。
     # 実績が無いだけなので、線を途切れさせて空欄にする。
@@ -289,6 +306,7 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
             "確定した月": st.cut_month or "(なし)",
             "確定月数": st.n_fixed,
             "見込んだ総工数(時間)": round(st.total_hours, 1),
+            "残工数の倍率(学習カーブ比)": round(st.remain_gain, 2),
             **_metrics(st.monthly, act_m, st.n_fixed, eval_last),
         })
     metrics = pd.DataFrame(rows)
@@ -335,6 +353,10 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
     pred_only = pd.DataFrame(0.0, index=pd.Index(months, name="月"), columns=groups)
     scaled_groups, kept_groups = [], []
 
+    # --- 各行程グループの 見込み総量 と 確定分 を出す ---
+    shape_f: dict[str, np.ndarray] = {}
+    total_g: dict[str, float] = {}
+    done_g: dict[str, float] = {}
     for g in groups:
         curve = fc.table[g].to_numpy(dtype=float)
         s = curve.sum()
@@ -345,22 +367,56 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
         p_done = float(f[:n_fixed].sum())   # その時点までに消化するはずの比率
 
         if basis == BASIS_SCALED and n_fixed and done > 0 and p_done > 1e-6:
-            total_g = done / p_done
+            tg = done / p_done
             scaled_groups.append(g)
         else:
-            total_g = s                     # 契約人月・見積もりから決まった総量
+            tg = s                          # 契約人月・見積もりから決まった総量
             if basis == BASIS_SCALED and n_fixed:
                 kept_groups.append(g)
-        remain = max(total_g - done, 0.0)
+        shape_f[g], total_g[g], done_g[g] = f, tg, done
 
+    # --- 残工数を案件全体で保存したまま配分する ---
+    #
+    # グループごとに 残り = 総量 − 確定分 を取ると、確定分が総量を超えたグループで
+    # 負の残工数が出る。これを単純に 0 で切ると、超過分がどこにも計上されないまま
+    # 消え、案件の総工数がその分だけ増える。
+    # マイルストーンの直後に工数が跳ね、合計が契約人月を上回るのはこれが原因だった。
+    #
+    # 超過は「他のグループの残りを前借りした」と読むのが自然なので、
+    # 案件全体の残工数 Σ総量 − Σ確定分 を正とし、
+    # まだ残っているグループへその比率で配り直す。
+    # どのグループも超過していなければ、各グループの残りはそのままになる。
+    sum_total = sum(total_g.values())
+    sum_done = sum(done_g.values())
+    target_remain = max(sum_total - sum_done, 0.0)
+    raw = {g: total_g[g] - done_g[g] for g in total_g}
+    pos = {g: v for g, v in raw.items() if v > 0}
+    pos_sum = sum(pos.values())
+    over = sorted(g for g, v in raw.items() if v < 0)
+
+    remain_g = {g: 0.0 for g in total_g}
+    if pos_sum > 0:
+        k = target_remain / pos_sum
+        for g, v in pos.items():
+            remain_g[g] = v * k
+
+    # 学習カーブがこの残り区間に置くはずだった量。
+    # 実際に配る残工数がこれより多ければ、その倍率のぶん切り替え点で工数が跳ねる。
+    shape_remain = sum(total_g[g] * float(shape_f[g][n_fixed:].sum()) for g in total_g)
+    remain_gain = (target_remain / shape_remain) if shape_remain > 1e-9 else 1.0
+
+    for g, f in shape_f.items():
+        remain = remain_g[g]
         rest_w = f[n_fixed:]
+        if not len(rest_w):
+            continue
+        col = pred_only.columns.get_loc(g)
         if rest_w.sum() > 0:
-            pred_only.iloc[n_fixed:, pred_only.columns.get_loc(g)] = \
-                remain * rest_w / rest_w.sum()
-        elif len(rest_w):
+            pred_only.iloc[n_fixed:, col] = remain * rest_w / rest_w.sum()
+        else:
             # 学習カーブがこの区間に何も置いていない(すべて確定分に入っている)。
             # 残工数を消せば総量が合わなくなるので、残り月へ均等に置く。
-            pred_only.iloc[n_fixed:, pred_only.columns.get_loc(g)] = remain / len(rest_w)
+            pred_only.iloc[n_fixed:, col] = remain / len(rest_w)
 
     table = table + pred_only
     total = float(table.to_numpy().sum())
@@ -376,6 +432,25 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
                         + (", ".join(known) if known else "(なし)")
                         + "。先のマイルストーンの日付はその時点では分かっていないため渡さず、"
                         "学習した平均位置を使う(渡すと未来を覗いた予測になり評価にならない)。")
+    if n_fixed and (remain_gain >= 1.3 or remain_gain <= 0.77):
+        pace = "少ない" if remain_gain > 1.0 else "多い"
+        notes.append(
+            f"確定分の実績が学習カーブの見込みより{pace}ため、残り区間に配る工数が"
+            f"学習カーブの {remain_gain:.2f} 倍になっている。"
+            f"総工数は動かさない決まりなので、そのずれは残り区間へ寄せるほかなく、"
+            f"{cut_month} の直後に{'上' if remain_gain > 1.0 else '下'}へ段差が出る。"
+            "この案件は学習した消化ペースから外れている、と読むこと。")
+    if over:
+        notes.append(
+            f"確定分が見込み総量を超えている行程グループ: {', '.join(over)}"
+            f"(計 {sum(-raw[g] for g in over):,.0f} 時間の超過)。"
+            "その超過は、まだ残っているグループの残工数から差し引いている"
+            "(案件全体の総工数を動かさないため)。")
+    if sum_total - sum_done <= 0 and n_fixed:
+        notes.append(
+            f"確定分の実績 {sum_done:,.0f} 時間が、見込み総量 {sum_total:,.0f} 時間に"
+            "既に達している。残工数は 0 として置いた。"
+            "この案件はこの時点で総量を超えており、残りを予測する意味が無い。")
     if scaled_groups:
         notes.append(f"総量を実績から引き直した行程グループ: {', '.join(scaled_groups)}")
     if kept_groups:
@@ -385,4 +460,5 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
 
     return Stage(idx=idx, label=label, milestone=milestone, cut_month=cut_month,
                  n_fixed=n_fixed, known_milestones=known, table=table,
-                 pred_only=pred_only, total_hours=total, notes=notes)
+                 pred_only=pred_only, total_hours=total, remain_gain=remain_gain,
+                 notes=notes)
