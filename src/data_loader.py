@@ -10,6 +10,7 @@ Excel/CSV というファイル形式の存在を知らない。
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
@@ -30,13 +31,17 @@ _ZEN_DIGITS = str.maketrans("０１２３４５６７８９．，", "0123456789.
 # 「プロジェクト情報の右にマイルストーンを足していく」入力形式の土台になる。
 PROJECT_BASE_COLS = ("案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス")
 
-# 同じマイルストーンを複数回書くときの見出しの書き方。
-#   α版 / α版#2 / α版#3      … 明示的な書き方(推奨)
-#   α版 / α版 / α版          … そのまま並べた場合。pandas が α版.1 / α版.2 に直す
-#   α版 / α版(2回目)         … 日本語で書いた場合
+# 同じマイルストーンが複数回あるときは、1つのセルにカンマ区切りで並べて書く。
+#   α版 の列に  2020-04-18, 2020-08-22, 2021-01-12
+# 列を増やす方式は、記入する列を間違える・列を足し忘れるといった事故が起きるため使わない。
+_DATE_SEPARATORS = re.compile(r"[,、;；\n\r]+")
+
+# 見出しが重複したときの後始末。
+# 利用者が同じ見出しを2つ作ってしまうと pandas が α版.1 のように直すので、
+# その分は同じマイルストーンとして読み直す(セルを移し替えさせない)。
+_PANDAS_DEDUP_SUFFIX = re.compile(r"\.\d+$")
 _REPEAT_SUFFIX = re.compile(
     r"(?:\s*[#＃]\s*\d+|\s*[（(]\s*\d+\s*回目\s*[)）])\s*$")
-_PANDAS_DEDUP_SUFFIX = re.compile(r"\.\d+$")
 
 # 同じマイルストーンが複数回あったとき、初回に付ける接尾辞。
 # 「レビューに入った日」と「通過した日」は別の意味を持つので、別のマイルストーンとして扱う。
@@ -179,10 +184,31 @@ def _read_settings(path: str) -> dict:
     return out
 
 
+def _parse_dates_cell(v) -> list[pd.Timestamp]:
+    """1セルの値を日付のリストにする。
+
+    通常は1つ。同じマイルストーンを複数回通過した案件では、
+    カンマ区切りで並べて書く(「2020-04-18, 2020-08-22」)。
+    区切りはカンマ・読点・セミコロン・改行を受け付ける。
+    日付そのものが 2020/4/18 のようにスラッシュを含むため、
+    スラッシュは区切りにしない。
+    """
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return []
+    if isinstance(v, (pd.Timestamp, dt.datetime, dt.date)):
+        return [pd.Timestamp(v)]
+    parts = [p.strip() for p in _DATE_SEPARATORS.split(str(v)) if p.strip()]
+    out = []
+    for p in parts:
+        d = pd.to_datetime(p, errors="coerce")
+        out.append(d if pd.notna(d) else None)
+    return out
+
+
 def _base_milestone_name(col: str, all_cols: list[str]) -> str:
     """マイルストーン列の見出しから、繰り返し回数の接尾辞を落として本来の名前を返す。
 
-    「α版#2」「α版(2回目)」は常に「α版」。
+    通常はそのまま。「α版#2」「α版(2回目)」のように書かれていれば「α版」に戻す。
     「α版.1」は pandas が重複見出しを機械的に直した形なので、
     接尾辞を落とした名前が同じシートに実在するときだけ落とす。
     「ver1.5」のような、本当に数字で終わる名前を壊さないための条件。
@@ -219,22 +245,26 @@ def _milestones_from_projects(projects: pd.DataFrame) -> tuple[pd.DataFrame, pd.
         return projects, pd.DataFrame(columns=["案件ID", "マイルストーン名", "日付"]), warnings
 
     rows, ms_cols, ignored = [], [], []
+    pids = projects["案件ID"].astype(str).str.strip().tolist()
     for col in extra:
-        parsed = pd.to_datetime(projects[col], errors="coerce")
-        if parsed.notna().sum() == 0:
+        parsed = [_parse_dates_cell(v) for v in projects[col]]
+        if not any(any(d is not None for d in lst) for lst in parsed):
             ignored.append(str(col))
             continue
         ms_cols.append(col)
         name = _base_milestone_name(col, list(projects.columns))
-        bad = projects[col].notna() & parsed.isna()
-        if bad.any():
-            ids = projects.loc[bad, "案件ID"].astype(str).tolist()
+        bad = [(pid, projects[col].iloc[i]) for i, (pid, lst) in enumerate(zip(pids, parsed))
+               if any(d is None for d in lst)]
+        if bad:
+            shown = ", ".join(f"{pid}({v!r})" for pid, v in bad[:5])
             warnings.append(
-                f"projects シートの「{col}」列に日付として読めない値があり、無視しました: "
-                + ", ".join(ids[:8]) + (" ほか" if len(ids) > 8 else ""))
-        for pid, d in zip(projects["案件ID"].astype(str), parsed):
-            if pd.notna(d):
-                rows.append({"案件ID": pid.strip(), "マイルストーン名": name, "日付": d})
+                f"projects シートの「{col}」列に日付として読めない値があり、その値だけ"
+                f"無視しました: {shown}" + (" ほか" if len(bad) > 5 else "")
+                + "。複数回あるマイルストーンはカンマ区切りで書くこと(例: 2020-04-18, 2020-08-22)。")
+        for pid, lst in zip(pids, parsed):
+            for d in lst:
+                if d is not None:
+                    rows.append({"案件ID": pid, "マイルストーン名": name, "日付": d})
 
     if ignored:
         warnings.append(

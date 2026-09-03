@@ -418,7 +418,8 @@ def wide_projects_frame(projects_rows, ms_rows) -> pd.DataFrame:
 
     マイルストーン名は見出し行に1回だけ現れるので、表記の揺れが起きない。
     空欄は「未記入」を表し、どの案件に何が入っているかがシート上で一目で分かる。
-    同じマイルストーンが複数回ある案件があれば、見出しを 名前#2 / 名前#3 と増やす。
+    同じマイルストーンが複数回ある案件は、1つのセルにカンマ区切りで並べる
+    (「2020-04-18, 2020-08-22」)。列は増やさない。
     """
     base = ["案件ID", "名称", "種別", "契約人月", "開始", "終了", "タグ", "ステータス"]
     df = pd.DataFrame(projects_rows, columns=base)
@@ -442,13 +443,8 @@ def wide_projects_frame(projects_rows, ms_rows) -> pd.DataFrame:
         cells[(str(pid), nm)] = sorted(sub["日付"].tolist())
 
     for nm in order:
-        rep = max((len(v) for (p, n), v in cells.items() if n == nm), default=1)
-        for i in range(1, rep + 1):
-            label = nm if i == 1 else f"{nm}#{i}"
-            df[label] = [
-                (cells.get((pid, nm), [])[i - 1].strftime("%Y-%m-%d")
-                 if len(cells.get((pid, nm), [])) >= i else None)
-                for pid in df["案件ID"].astype(str)]
+        df[nm] = [", ".join(d.strftime("%Y-%m-%d") for d in cells.get((pid, nm), [])) or None
+                  for pid in df["案件ID"].astype(str)]
     return df
 
 
@@ -470,7 +466,7 @@ def build_master(projects_rows, ms_rows):
                      "ステータス列より右はマイルストーン列で、見出しがマイルストーン名、"
                      "セルが日付(YYYY-MM-DD)。空欄=未記入で、記入が無くても動作する(設計書 3-2)。"
                      "同じマイルストーンを一度で通過できず複数回訪れた場合は、"
-                     "見出しを α版 / α版#2 / α版#3 と増やす。"
+                     "同じセルにカンマ区切りで並べる(例: 2020-04-18, 2020-08-22)。列は増やさない。"
                      "最終回を工程の境目、初回を「α版(初回)」という別のマイルストーンとして扱う。")
 
     # --- estimates ---

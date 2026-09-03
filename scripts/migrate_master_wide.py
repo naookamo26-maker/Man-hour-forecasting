@@ -15,7 +15,8 @@
   - 案件1行を書けば入力が終わる
 
 同じマイルストーンを複数回通過した場合(通らずにやり直した場合)は、
-見出しを α版 / α版#2 / α版#3 と増やす。
+1つのセルにカンマ区切りで日付を並べる(「2020-04-18, 2020-08-22」)。
+列を増やす方式は、記入する列を間違える事故が起きるので使わない。
 
     python scripts/migrate_master_wide.py                 # data/master.xlsx を変換
     python scripts/migrate_master_wide.py --master path/to/master.xlsx
@@ -117,14 +118,6 @@ def main(argv=None) -> int:
     ms["位置"] = ms.apply(_pos, axis=1)
     order = ms.groupby("マイルストーン名")["位置"].mean().sort_values().index.tolist()
 
-    # 同じ案件に同じマイルストーンが複数回あれば、#2 / #3 と列を増やす。
-    max_rep = {nm: int(ms[ms["マイルストーン名"] == nm]
-                       .groupby("案件ID").size().max()) for nm in order}
-    columns: list[tuple[str, str, int]] = []      # (列見出し, 名前, 何回目)
-    for nm in order:
-        for i in range(1, max_rep[nm] + 1):
-            columns.append((nm if i == 1 else f"{nm}#{i}", nm, i))
-
     table = {(pid, nm): [] for pid in pids for nm in order}
     for (pid, nm), sub in ms.groupby(["案件ID", "マイルストーン名"]):
         if (pid, nm) in table:
@@ -135,21 +128,28 @@ def main(argv=None) -> int:
         print(f"[警告] projects に無い案件のマイルストーンは移行できません: "
               f"{', '.join(unknown[:8])}" + (" ほか" if len(unknown) > 8 else ""))
 
+    # マイルストーン1つにつき1列。複数回ある案件はそのセルにカンマ区切りで並べる。
     base_n = len(header)
-    for j, (label, nm, i) in enumerate(columns):
+    for j, nm in enumerate(order):
         col = base_n + j + 1
-        cell = ws.cell(row=1, column=col, value=label)
+        cell = ws.cell(row=1, column=col, value=nm)
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center")
-        ws.column_dimensions[cell.column_letter].width = max(12, len(label) + 4)
+        rep = max((len(v) for (p, n), v in table.items() if n == nm), default=1)
+        ws.column_dimensions[cell.column_letter].width = max(12, len(nm) + 4, rep * 13)
         for k, pid in enumerate(pids):
             dates = table.get((pid, nm), [])
             c = ws.cell(row=2 + k, column=col)
             c.fill = INPUT_FILL
-            c.number_format = "yyyy-mm-dd"
-            if len(dates) >= i:
-                c.value = dates[i - 1].to_pydatetime()
+            if len(dates) == 1:
+                c.value = dates[0].to_pydatetime()
+                c.number_format = "yyyy-mm-dd"
+            elif dates:
+                # 複数日付はカンマ区切りの文字列で入れる。Excel に日付として
+                # 解釈させないため、書式は文字列のままにする。
+                c.value = ", ".join(d.strftime("%Y-%m-%d") for d in dates)
+                c.number_format = "@"
 
     if a.drop_old:
         del wb["milestones"]
@@ -163,7 +163,7 @@ def main(argv=None) -> int:
     n_filled = sum(1 for pid in pids for nm in order if table.get((pid, nm)))
     print(f"変換しました: {a.master}")
     print(f"  バックアップ : {backup}")
-    print(f"  追加した列   : {len(columns)} 列  ({', '.join(c[0] for c in columns)})")
+    print(f"  追加した列   : {len(order)} 列  ({', '.join(order)})")
     print(f"  記入済みセル : {sum(len(table.get((pid, nm), [])) for pid in pids for nm in order)} 件"
           f" / {len(pids)} 案件中 {len({pid for pid in pids if any(table.get((pid, nm)) for nm in order)})} 案件に記入あり")
     repeats = [(pid, nm, len(v)) for (pid, nm), v in table.items() if len(v) > 1]
