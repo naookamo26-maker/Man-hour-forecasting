@@ -28,6 +28,7 @@ from src.forecast import forecast
 from src.learning import (aggregate_actuals, build_project_curves, group_names,
                           learn, project_monthly)
 from src.phased import BASIS_FIXED, BASIS_MODES, BASIS_SCALED, phased_forecast
+from src.ramp import LIMIT_AUTO, observed_growth_limit
 from src.timeaxis import RECON_BOX, RECON_MODES, RECON_SMOOTH
 from src.validation import leave_one_out
 
@@ -76,6 +77,12 @@ def parse_args(argv=None):
     p.add_argument("--remain-basis", choices=["fixed", "scaled"], default=None,
                    help="段階予測の残工数の決め方。fixed=契約・見積もりの総量を固定して"
                         "残り=総量-確定分(既定) / scaled=確定分の実績から総量を引き直す")
+    p.add_argument("--ramp-limit", default=None,
+                   help="月次工数の増加率の上限(前月比)。自動=実績の前月比90%点から決める(既定) / "
+                        "数値(例 1.3) / off=制約なし")
+    p.add_argument("--ramp-scope", choices=["phased", "all", "off"], default="phased",
+                   help="立ち上がり上限をどこに効かせるか。phased=段階予測のみ(既定) / "
+                        "all=全期間予測と検証にも効かせる / off=使わない")
     p.add_argument("--out", default=None, help="出力Excelのパス")
     p.add_argument("--no-validate", action="store_true", help="leave-one-out を実行しない")
     p.add_argument("--no-cache", action="store_true", help="実績のparquetキャッシュを使わない")
@@ -115,6 +122,8 @@ def _run(argv=None) -> int:
         overrides["伸縮率上限"] = a.max_stretch
     if a.reconstruct:
         overrides["カーブ復元"] = RECON_BOX if a.reconstruct == "box" else RECON_SMOOTH
+    if a.ramp_limit is not None:
+        overrides["立ち上がり上限"] = a.ramp_limit
 
     print("=" * 72)
     print("工数予測システム(第1版:素朴版 + マイルストーン位置合わせ)")
@@ -138,6 +147,24 @@ def _run(argv=None) -> int:
             f"(指定値: {max_stretch_raw})")
     if recon not in RECON_MODES:
         raise ValueError(f"カーブ復元 は {' / '.join(RECON_MODES)} のいずれか(指定値: {recon!r})")
+
+    # 立ち上がり上限。「自動」は学習データの前月比から決めるので、集約後でないと出せない。
+    # ここでは指定値の解釈だけ行い、自動の解決は集約のあとで行う。
+    raw_ramp = str(ds.settings["立ち上がり上限"]).strip()
+    if a.ramp_scope == "off" or raw_ramp.lower() in ("off", "なし", ""):
+        ramp_spec = None
+    elif raw_ramp == LIMIT_AUTO:
+        ramp_spec = LIMIT_AUTO
+    else:
+        try:
+            ramp_spec = float(raw_ramp)
+        except ValueError:
+            raise ValueError(
+                f"立ち上がり上限 は 自動 / 数値(例 1.3) / off のいずれか(指定値: {raw_ramp!r})") from None
+        if ramp_spec <= 1.0:
+            raise ValueError(
+                f"立ち上がり上限 は 1 より大きい値を指定してください(指定値: {ramp_spec})。"
+                "制約を外すなら off と書きます。")
     hpm = ds.hours_per_mm
 
     print(f"[1/5] 読み込み  案件 {len(ds.projects)} 件 / 実績 {len(ds.actuals):,} 行 "
@@ -151,6 +178,16 @@ def _run(argv=None) -> int:
           f"(集約軸: {ds.group_col}、{len(groups)} グループ)")
     print(f"                学習に使える案件: {len(curves)} 件"
           f" / 実績に現れる案件 {agg['案件ID'].nunique()} 件")
+
+    # 全期間予測・検証に効かせる上限。段階予測は対象案件を学習から外した上で
+    # 自前に決め直すため、ここで決めるのは scope=all のときに使う値になる。
+    ramp_all = None
+    if ramp_spec is not None and a.ramp_scope == "all":
+        ramp_all = (observed_growth_limit([c.monthly.sum(axis=1).to_numpy()
+                                           for c in curves.values()])
+                    if ramp_spec == LIMIT_AUTO else float(ramp_spec))
+        if ramp_all is None:
+            print("                立ち上がり上限は実績から決められないため使いません。")
 
     # --- 学習 ---
     model = learn(curves, groups, align=align, n_bin=n_bin,
@@ -236,7 +273,8 @@ def _run(argv=None) -> int:
     # 見積もりがあればそれをグループ別総量の正とし、無ければ契約人月を学習比率で割る。
     est = {} if a.ignore_estimates else ds.estimates_of(target)
     excl = [s.strip() for s in (a.exclude_group or "").split(";") if s.strip()]
-    fc = forecast(model, ds, target, group_totals=est or None, exclude_groups=excl)
+    fc = forecast(model, ds, target, group_totals=est or None, exclude_groups=excl,
+                  ramp_limit=ramp_all)
 
     src = "見積もり(estimates)" if est else "契約人月 + 学習比率"
     print(f"[4/5] 予測      {target} {fc.name}  "
@@ -265,7 +303,7 @@ def _run(argv=None) -> int:
                 ds, curves, groups, agg, target, align=align, n_bin=n_bin,
                 backbone_spec=backbone_spec, backbone_coverage=coverage,
                 hours_per_mm=hpm, recon=recon, warp_strength=warp_strength,
-                max_stretch=max_stretch, basis=basis,
+                max_stretch=max_stretch, basis=basis, ramp_limit=ramp_spec,
                 group_totals=est or None, exclude_groups=excl)
         except ValueError as e:
             # 段階予測はあくまで検証用の付録。ここで落ちても本体の予測は出す。
@@ -278,7 +316,9 @@ def _run(argv=None) -> int:
               "(--phased on で強制)")
 
     if phased is not None:
-        print(f"        段階予測  {len(phased.stages)} 段階 / 残工数の決め方: {basis}")
+        lim = (f"{phased.ramp_limit:.2f} 倍/月" if phased.ramp_limit else "なし")
+        print(f"        段階予測  {len(phased.stages)} 段階 / 残工数の決め方: {basis}"
+              f" / 立ち上がり上限: {lim}")
         for _, r in phased.metrics.iterrows():
             w = r["残り月次WAPE"]
             print(f"    段階{int(r['段階'])} {str(r['区切り']):<12} "
@@ -297,7 +337,8 @@ def _run(argv=None) -> int:
         detail, monthly, summary = leave_one_out(
             ds, curves, groups, n_bin=n_bin, backbone_spec=backbone_spec,
             backbone_coverage=coverage, hours_per_mm=hpm, recons=recons,
-            warp_strength=warp_strength, max_stretch=max_stretch)
+            warp_strength=warp_strength, max_stretch=max_stretch,
+            ramp_limit=ramp_all)
         print("[5/5] 検証      leave-one-out 完了")
         print()
         for _, r in summary.iterrows():
@@ -334,6 +375,10 @@ def _run(argv=None) -> int:
         "除外した行程グループ": ", ".join(dropped) or "(なし)",
         "段階予測": (f"{len(phased.stages)} 段階 / 残工数の決め方: {phased.basis}"
                      if phased is not None else "(出力なし)"),
+        "立ち上がり上限": (
+            f"{ramp_all:.2f} 倍/月(全期間予測・検証にも適用)" if ramp_all
+            else (f"{phased.ramp_limit:.2f} 倍/月(段階予測のみ)"
+                  if phased is not None and phased.ramp_limit else "使用しない")),
         "実装範囲": "実装順序 1〜2(素朴版 + マイルストーン位置合わせ) + 見積もりによる総量指定",
         "未使用パラメータ": f"k={ds.settings['k']}, タグ重み係数={ds.settings['タグ重み係数']} "
                             f"(実装順序 3・4 で使用予定)",

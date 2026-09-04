@@ -45,6 +45,7 @@ import pandas as pd
 
 from .forecast import forecast
 from .learning import ProjectCurve, learn
+from .ramp import LIMIT_AUTO, apply_ramp, observed_growth_limit
 from .timeaxis import RECON_BOX
 
 BASIS_FIXED = "契約総量固定"
@@ -69,6 +70,8 @@ class Stage:
     # 1.0 なら学習カーブどおり。1 より大きいほど「確定分が学習カーブより少ない」ことを
     # 意味し、その差が残り区間へ上乗せされる = 切り替え点で工数が跳ねる。
     # 跳ねの高さはこの倍率そのものなので、グラフの段差を見たらまずここを見る。
+    ramp: dict = field(default_factory=dict)
+    # 立ち上がり制約の診断。上限に当たった月数、境界段差の前後、山の移動量。
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -86,6 +89,7 @@ class PhasedResult:
     eval_last: int              # 実績が存在する最後の月の位置。ここまでしか答え合わせできない
     stages: list[Stage]
     basis: str
+    ramp_limit: float | None    # 使った立ち上がり上限(前月比)。None = 制約なし
     series: pd.DataFrame        # 月 × 系列(実績 + 各段階)の合計時間
     metrics: pd.DataFrame       # 段階ごとの誤差
     warnings: list[str] = field(default_factory=list)
@@ -197,6 +201,7 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
                     hours_per_mm: float = 160.0, recon: str = RECON_BOX,
                     warp_strength: float = 1.0, max_stretch: float | None = None,
                     basis: str = BASIS_FIXED,
+                    ramp_limit: float | str | None = LIMIT_AUTO,
                     group_totals: dict[str, float] | None = None,
                     exclude_groups: list[str] | None = None) -> PhasedResult:
     """1案件について、マイルストーンごとに実績を確定させた段階予測を作る。
@@ -220,6 +225,20 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
             f"{pid} は完了案件として学習データに入っているため、"
             f"段階予測では自分自身を学習から外した {len(rest)} 件で学習し直している"
             "(自分の実績で学習したカーブで自分を予測すると評価にならない)。")
+
+    # 立ち上がり上限。既定は学習データの前月比から決める。
+    # 対象案件は学習から外しているので、上限も対象案件を見ずに決まる。
+    if ramp_limit == LIMIT_AUTO:
+        ramp_limit = observed_growth_limit(
+            [c.monthly.sum(axis=1).to_numpy() for c in rest.values()])
+        if ramp_limit is None:
+            warnings.append(
+                "立ち上がり上限を実績から決められなかった(学習データの月数が少なすぎる)ため、"
+                "制約なしで計算している。")
+    elif ramp_limit is not None:
+        ramp_limit = float(ramp_limit)
+        if ramp_limit <= 1.0:
+            ramp_limit = None
 
     model = learn(rest, groups, align=align, n_bin=n_bin,
                   backbone_spec=backbone_spec, backbone_coverage=backbone_coverage,
@@ -262,6 +281,7 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
         _build_stage(model, ds, pid, idx=0, label="段階0 着手前", milestone="",
                      cut_idx=-1, cut_month=None, known=[], months=months,
                      groups=fgroups, actual=actual, basis=basis,
+                     ramp_limit=ramp_limit,
                      group_totals=group_totals, exclude_groups=exclude_groups)
     ]
     for i, (nm, date, ci) in enumerate(points, start=1):
@@ -271,8 +291,8 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
                          label=f"段階{i} {nm}後({months[ci]}まで確定)",
                          milestone=nm, cut_idx=ci, cut_month=months[ci],
                          known=known, months=months, groups=fgroups,
-                         actual=actual, basis=basis, group_totals=group_totals,
-                         exclude_groups=exclude_groups))
+                         actual=actual, basis=basis, ramp_limit=ramp_limit,
+                         group_totals=group_totals, exclude_groups=exclude_groups))
 
     # 総工数の保存を実行時に確かめる。
     # 段階の総工数は「見込み総量」と一致しなければならない。
@@ -307,12 +327,14 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
             "確定月数": st.n_fixed,
             "見込んだ総工数(時間)": round(st.total_hours, 1),
             "残工数の倍率(学習カーブ比)": round(st.remain_gain, 2),
+            "立上り制約に当たった月数": int(st.ramp.get("制約に当たった月数", 0)),
             **_metrics(st.monthly, act_m, st.n_fixed, eval_last),
         })
     metrics = pd.DataFrame(rows)
 
     return PhasedResult(pid=pid, name=base.name, months=months, groups=fgroups,
                         actual=actual, eval_last=eval_last, stages=stages, basis=basis,
+                        ramp_limit=ramp_limit,
                         series=series, metrics=metrics, warnings=warnings)
 
 
@@ -331,7 +353,8 @@ def _actual_table(agg: pd.DataFrame, pid: str, months: list[str],
 def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
                  cut_idx: int, cut_month: str | None, known: list[str],
                  months: list[str], groups: list[str], actual: pd.DataFrame,
-                 basis: str, group_totals, exclude_groups) -> Stage:
+                 basis: str, ramp_limit: float | None,
+                 group_totals, exclude_groups) -> Stage:
     """1段階分を組み立てる。
 
     予測そのものは通常の forecast() をそのまま使う。
@@ -418,6 +441,25 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
             # 残工数を消せば総量が合わなくなるので、残り月へ均等に置く。
             pred_only.iloc[n_fixed:, col] = remain / len(rest_w)
 
+    # --- 立ち上がり制約 ---
+    # ここまでの pred_only は「残工数を学習カーブの形どおりに配る」だけなので、
+    # 遅れている案件では確定区間の直後にいきなり工数が跳ね、最初の月が最大値になる。
+    # 実際には人員はそう急には増えず、山は後ろへ移動してなだらかになる。
+    # 月次の増加率に上限を置き、あふれた分を後ろの月へ送ることでそれを再現する。
+    # グループ別の総量も案件の総工数も動かさない。動かすのは いつ消化するか だけ。
+    ramp_info: dict = {}
+    if ramp_limit and n_fixed and n_fixed < len(months):
+        rest_tbl = pred_only.iloc[n_fixed:]
+        base = float(fixed.iloc[-1].sum())
+        if base <= 0:
+            # 直前の月に実績が無い(締め遅れ・休止)。そこを起点にすると制約が過剰に効く。
+            nz = fixed.sum(axis=1).to_numpy()
+            nz = nz[nz > 0]
+            base = float(nz[-3:].mean()) if len(nz) else 0.0
+        fitted, ramp_info = apply_ramp(rest_tbl, base, ramp_limit)
+        if ramp_info.get("適用"):
+            pred_only.iloc[n_fixed:] = fitted.to_numpy()
+
     table = table + pred_only
     total = float(table.to_numpy().sum())
 
@@ -432,6 +474,21 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
                         + (", ".join(known) if known else "(なし)")
                         + "。先のマイルストーンの日付はその時点では分かっていないため渡さず、"
                         "学習した平均位置を使う(渡すと未来を覗いた予測になり評価にならない)。")
+    if ramp_info.get("適用"):
+        moved = ramp_info["ピーク位置 後"] - ramp_info["ピーク位置 前"]
+        notes.append(
+            f"立ち上がり上限 {ramp_info['上限']:.2f} 倍/月 を適用した。"
+            f"{ramp_info['制約に当たった月数']} ヶ月が上限に当たり、あふれた工数を後ろの月へ送っている。"
+            f"確定区間直後の段差 {ramp_info['境界段差 前']:.2f} 倍 → "
+            f"{ramp_info['境界段差 後']:.2f} 倍"
+            + (f"、山の位置が {moved} ヶ月後ろへ移動。" if moved else "。")
+            + "総工数と行程グループ別の総量は動かしていない。")
+    elif ramp_info.get("収まらない"):
+        notes.append(
+            f"[要注意] {ramp_info['理由']}。"
+            "総量を動かさない決まりを優先して制約を外しているため、"
+            "この段階のカーブは現実には出せない立ち上がりを含む。"
+            "期間内に終わらない可能性を示す信号として読むこと。")
     if n_fixed and (remain_gain >= 1.3 or remain_gain <= 0.77):
         pace = "少ない" if remain_gain > 1.0 else "多い"
         notes.append(
@@ -461,4 +518,4 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
     return Stage(idx=idx, label=label, milestone=milestone, cut_month=cut_month,
                  n_fixed=n_fixed, known_milestones=known, table=table,
                  pred_only=pred_only, total_hours=total, remain_gain=remain_gain,
-                 notes=notes)
+                 ramp=ramp_info, notes=notes)

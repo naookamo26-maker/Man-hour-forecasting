@@ -65,6 +65,7 @@ def leave_one_out(ds, curves: dict[str, ProjectCurve], groups: list[str], *,
                   backbone_coverage: float = 0.6, hours_per_mm: float = 160.0,
                   modes=MODES,
                   warp_strength: float = 1.0, max_stretch: float | None = None,
+                  ramp_limit: float | None = None,
                   recons=(RECON_BOX,)) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """leave-one-out を実行する。
 
@@ -95,7 +96,8 @@ def leave_one_out(ds, curves: dict[str, ProjectCurve], groups: list[str], *,
                           hours_per_mm=hours_per_mm, recon=recon,
                           warp_strength=warp_strength, max_stretch=max_stretch)
             fc = forecast(model, ds, held, use_given_milestones=use_given,
-                          months_override=curves[held].months)
+                          months_override=curves[held].months,
+                          ramp_limit=ramp_limit)
 
             # 形の比較に集中するため、量は実績合計に合わせる
             pred = fc.table * (act_total / fc.table.to_numpy().sum())
