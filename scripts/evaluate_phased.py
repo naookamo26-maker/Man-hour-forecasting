@@ -43,6 +43,9 @@ def parse_args(argv=None):
     p.add_argument("--align", choices=["on", "off"], default=None)
     p.add_argument("--basis", choices=["fixed", "scaled", "both"], default="both",
                    help="残工数の決め方。既定は両方を並べる")
+    p.add_argument("--ramp-limit", default=None,
+                   help="立ち上がり上限。自動(既定) / 数値 / off。"
+                        "compare を指定すると 制約あり・なし を並べて比較する")
     p.add_argument("--csv", default=None, help="案件×段階の明細をCSVに書き出す")
     return p.parse_args(argv)
 
@@ -69,11 +72,22 @@ def main(argv=None) -> int:
     bases = BASIS_MODES if a.basis == "both" else \
         (BASIS_MODES[0],) if a.basis == "fixed" else (BASIS_MODES[1],)
 
+    raw = a.ramp_limit
+    if raw == "compare":
+        ramps = [("制約なし", None), ("立ち上がり上限", "自動")]
+    elif raw is None:
+        ramps = [("立ち上がり上限", "自動")]
+    elif str(raw).lower() in ("off", "なし"):
+        ramps = [("制約なし", None)]
+    else:
+        ramps = [(f"上限 {raw}", float(raw))]
+
     rows = []
-    for basis in bases:
+    for rlab, rlim in ramps:
+      for basis in bases:
         for pid in sorted(curves):
             ph = phased_forecast(
-                ds, curves, groups, agg, pid, align=align,
+                ds, curves, groups, agg, pid, align=align, ramp_limit=rlim,
                 n_bin=int(ds.settings["カーブ解像度"]),
                 backbone_spec=str(ds.settings["背骨マイルストーン"]),
                 backbone_coverage=float(ds.settings["背骨最小カバー率"]),
@@ -82,6 +96,7 @@ def main(argv=None) -> int:
             n_month = len(ph.months)
             for _, r in ph.metrics.iterrows():
                 rows.append({
+                    "立ち上がり": rlab,
                     "残工数の決め方": basis,
                     "案件ID": pid,
                     "名称": ph.name,
@@ -93,6 +108,7 @@ def main(argv=None) -> int:
                     "残り総量誤差(%)": r["残り総量誤差(%)"],
                     "累積カーブ最大乖離": r["累積カーブ最大乖離"],
                     "残りが全体に占める割合(%)": r["残りが全体に占める割合(%)"],
+                    "立上り制約に当たった月数": r["立上り制約に当たった月数"],
                 })
     d = pd.DataFrame(rows)
 
@@ -103,6 +119,17 @@ def main(argv=None) -> int:
     print("評価は残り区間だけで行う(確定分は実績そのもので誤差0のため)。")
     print("段階が進む = 確定が増える につれて誤差が下がっていれば、")
     print("予測は追加された実績を正しく使えている。")
+
+    if len(ramps) > 1:
+        print("\n■ 立ち上がり上限の効果(残り月次WAPE の平均)")
+        cmp_r = (d.pivot_table(index="確定区分", columns="立ち上がり", values="残り月次WAPE",
+                               aggfunc="mean", observed=True)
+                   .reindex(["0% (着手前)", "〜25%", "〜50%", "〜75%", "75%超"])
+                   .dropna(how="all").round(3))
+        print(cmp_r.to_string())
+        hit = d[d["立ち上がり"] != "制約なし"]["立上り制約に当たった月数"]
+        print(f"  制約が効いた段階: {int((hit > 0).sum())}/{len(hit)}")
+        d = d[d["立ち上がり"] == ramps[-1][0]]
 
     order = [b for b in BASIS_MODES if b in set(d["残工数の決め方"])]
     for basis in order:

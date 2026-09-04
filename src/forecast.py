@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .learning import Model
+from .ramp import apply_ramp
 from .timeaxis import (Warp, canonical_to_monthly, date_to_t, month_edges,
                        month_list, t_to_date)
 
@@ -102,7 +103,8 @@ def forecast(model: Model, ds, pid: str, *,
              known_milestones: set[str] | None = None,
              group_totals: dict[str, float] | None = None,
              months_override: list[str] | None = None,
-             exclude_groups: list[str] | None = None) -> Forecast:
+             exclude_groups: list[str] | None = None,
+             ramp_limit: float | None = None) -> Forecast:
     """1案件の 月 × 行程グループ 工数を予測する。
 
     exclude_groups にその案件が行わない行程グループを渡すと、
@@ -229,6 +231,22 @@ def forecast(model: Model, ds, pid: str, *,
         s = monthly.sum()
         cols[g] = monthly / s * float(gt[g]) if s > 0 else np.zeros(len(months))
     table = pd.DataFrame(cols, index=pd.Index(months, name="月"))[groups]
+
+    # 立ち上がり制約(任意)。位置合わせは伸縮率がアンカーの前後で不連続に変わるため、
+    # その境目に月次工数の段差や鋭い突起が出る。月次の増加率に上限を置くと、
+    # 総量と行程グループ別の総量を動かさないまま、その尖りだけを均せる。
+    # 既定では効かせない。全期間予測に効かせると位置合わせの評価そのものが変わるため、
+    # 効果を実データで確かめてから採用すること(設計書 15章)。
+    if ramp_limit and ramp_limit > 1.0 and len(table) >= 2:
+        # 先頭月には縛る相手がいない。自分自身を起点にして2ヶ月目以降だけを縛る。
+        base = float(table.iloc[0].sum()) / ramp_limit
+        fitted, info = apply_ramp(table, base, ramp_limit)
+        if info.get("適用"):
+            table = fitted
+            notes.append(
+                f"立ち上がり上限 {ramp_limit:.2f} 倍/月 を適用しました"
+                f"({info['制約に当たった月数']} ヶ月が上限に当たり、工数を後ろの月へ送っています)。"
+                "総工数と行程グループ別の総量は変わりません。")
 
     # 丸め誤差の吸収。合計は必ず総時間に一致させる。
     diff = total_hours - table.to_numpy().sum()
