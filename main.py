@@ -2,21 +2,23 @@
 工数予測システム ─ エントリポイント
 
 使い方
-    python main.py                                # 既定設定で実行
+    python main.py                                # ステータス=予測対象 の案件をすべて出力
     python main.py --target PJ-2026-K             # 予測対象を指定
+    python main.py --target PJ-2026-K,PJ-2027-L   # 複数指定(, または ; 区切り)
     python main.py --align off                    # 素朴版(位置合わせなし)
     python main.py --group-col 大分類             # 学習粒度を変える
     python main.py --no-validate                  # leave-one-out を省略して高速に
     python main.py --target PJ-2021-E --phased on # 完了案件で段階予測を確かめる
 
-出力ファイル名には条件が埋め込まれる(設計書 7章)。
-    output/forecast_PJ-2026-K_align-on_行程グループ.xlsx
+出力ファイル名は 案件の名称 + 条件 になる(設計書 7章)。
+    output/蒼穹のレガリア II_align-on_行程グループ.xlsx
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -27,12 +29,31 @@ from src.excel_writer import write_workbook
 from src.forecast import forecast
 from src.learning import (aggregate_actuals, build_project_curves, group_names,
                           learn, project_monthly)
-from src.phased import BASIS_FIXED, BASIS_MODES, BASIS_SCALED, phased_forecast
+from src.phased import (BASIS_FIXED, BASIS_MODES, BASIS_SCALED, MS_ALL,
+                        MS_MODES, MS_PASSED, phased_forecast)
 from src.ramp import LIMIT_AUTO, observed_growth_limit
 from src.timeaxis import RECON_BOX, RECON_MODES, RECON_SMOOTH
 from src.validation import leave_one_out
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Windows で使えない文字と、末尾に置けない文字
+_BAD_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_WS = re.compile(r"\s+")
+
+
+def safe_filename(name: str, fallback: str, limit: int = 80) -> str:
+    """案件の名称をファイル名に使える形にする。
+
+    名称には「クロノスギア:蒼き遺産」のようにファイル名に使えない文字が入りうる。
+    そのまま渡すと OS 依存で失敗するので、ここで落とす。
+    空になった場合や、そもそも名称が未記入の場合は案件IDに戻す。
+    """
+    s = _BAD_CHARS.sub("", str(name or ""))
+    s = _WS.sub(" ", s).strip().strip(".")
+    if len(s) > limit:
+        s = s[:limit].rstrip()
+    return s or str(fallback)
 
 
 def parse_args(argv=None):
@@ -42,7 +63,8 @@ def parse_args(argv=None):
     p.add_argument("--actuals", default=os.path.join(ROOT, "data", "actuals.csv"),
                    help="実績CSVのパス")
     p.add_argument("--target", default=None,
-                   help="予測対象の案件ID。省略時は ステータス=予測対象 の先頭案件")
+                   help="予測対象の案件ID。, または ; 区切りで複数指定できる。"
+                        "省略時は ステータス=予測対象 の案件をすべて出力する")
     p.add_argument("--align", choices=["on", "off"], default=None,
                    help="マイルストーン位置合わせ。省略時は settings の値")
     p.add_argument("--group-col", default=None,
@@ -77,13 +99,20 @@ def parse_args(argv=None):
     p.add_argument("--remain-basis", choices=["fixed", "scaled"], default=None,
                    help="段階予測の残工数の決め方。fixed=契約・見積もりの総量を固定して"
                         "残り=総量-確定分(既定) / scaled=確定分の実績から総量を引き直す")
+    p.add_argument("--phased-milestones", choices=["すべて", "通過済み"], default=None,
+                   help="段階予測でマイルストーンをどこまで既知とするか。"
+                        "すべて=記入済みの日付を全部使う(既定・「予測」シートと同じ条件) / "
+                        "通過済み=その段階までに通過したものだけ(未来を覗かない)")
     p.add_argument("--ramp-limit", default=None,
                    help="月次工数の増加率の上限(前月比)。自動=実績の前月比90%点から決める(既定) / "
                         "数値(例 1.3) / off=制約なし")
     p.add_argument("--ramp-scope", choices=["phased", "all", "off"], default="phased",
                    help="立ち上がり上限をどこに効かせるか。phased=段階予測のみ(既定) / "
                         "all=全期間予測と検証にも効かせる / off=使わない")
-    p.add_argument("--out", default=None, help="出力Excelのパス")
+    p.add_argument("--out", default=None,
+                   help="出力Excelのパス。予測対象が1件のときだけ指定できる")
+    p.add_argument("--out-dir", default=None,
+                   help="出力先ディレクトリ。既定は output/")
     p.add_argument("--no-validate", action="store_true", help="leave-one-out を実行しない")
     p.add_argument("--no-cache", action="store_true", help="実績のparquetキャッシュを使わない")
     return p.parse_args(argv)
@@ -124,6 +153,8 @@ def _run(argv=None) -> int:
         overrides["カーブ復元"] = RECON_BOX if a.reconstruct == "box" else RECON_SMOOTH
     if a.ramp_limit is not None:
         overrides["立ち上がり上限"] = a.ramp_limit
+    if a.phased_milestones is not None:
+        overrides["段階予測のマイルストーン"] = a.phased_milestones
 
     print("=" * 72)
     print("工数予測システム(第1版:素朴版 + マイルストーン位置合わせ)")
@@ -165,6 +196,10 @@ def _run(argv=None) -> int:
             raise ValueError(
                 f"立ち上がり上限 は 1 より大きい値を指定してください(指定値: {ramp_spec})。"
                 "制約を外すなら off と書きます。")
+    ms_mode = str(ds.settings["段階予測のマイルストーン"]).strip()
+    if ms_mode not in MS_MODES:
+        raise ValueError(
+            f"段階予測のマイルストーン は {' / '.join(MS_MODES)} のいずれか(指定値: {ms_mode!r})")
     hpm = ds.hours_per_mm
 
     print(f"[1/5] 読み込み  案件 {len(ds.projects)} 件 / 実績 {len(ds.actuals):,} 行 "
@@ -190,13 +225,23 @@ def _run(argv=None) -> int:
             print("                立ち上がり上限は実績から決められないため使いません。")
 
     # --- 学習 ---
-    model = learn(curves, groups, align=align, n_bin=n_bin,
+    # 予測対象が完了案件の場合(予測の妥当性を測るときがこれ)、その案件を学習に
+    # 入れたままにすると自分の実績で学習したカーブで自分を予測することになる。
+    # 案件ごとに、その案件だけを外して学習し直す。
+    #
+    # 予測対象をまとめて外して1回だけ学習するほうが速いが、それをすると
+    # 対象の数だけ学習データが減る。1件ずつ外して学習し直すほうが、
+    # どの案件についても使える学習データが最大になる。
+    def learn_pair(subset):
+        m = learn(subset, groups, align=align, n_bin=n_bin,
                   backbone_spec=backbone_spec, backbone_coverage=coverage,
                   hours_per_mm=hpm, recon=recon,
                   warp_strength=warp_strength, max_stretch=max_stretch)
-    model_naive = (learn(curves, groups, align=False, n_bin=n_bin, hours_per_mm=hpm,
-                         recon=recon)
-                   if align else None)
+        mn = (learn(subset, groups, align=False, n_bin=n_bin, hours_per_mm=hpm,
+                    recon=recon) if align else None)
+        return m, mn
+
+    model, model_naive = learn_pair(curves)
     print(f"[3/5] 学習      位置合わせ {'ON' if align else 'OFF'} / "
           f"背骨: {', '.join(model.backbone) or '(なし)'} / カーブ復元: {recon}")
     if not model.backbone and align:
@@ -260,78 +305,31 @@ def _run(argv=None) -> int:
             f"({r['乖離率(%)']:+.1f}%)。カーブの形は正規化して学習するため予測には影響しないが、"
             "実績の記録漏れが無いか確認すること。")
 
-    # --- 予測 ---
-    target = a.target
-    if target is None:
+    # --- 予測対象の決定 ---
+    # 予測対象が複数あるのは普通のことなので、1回の実行で全部出す。
+    # 学習と検証は対象案件に依存しないため、ここまでの結果をそのまま使い回す。
+    if a.target:
+        targets = [t.strip() for t in re.split(r"[,;]", a.target) if t.strip()]
+        unknown = [t for t in targets if t not in ds.known_ids]
+        if unknown:
+            raise ValueError(
+                f"指定された案件が projects シートにありません: {', '.join(unknown)}")
+    else:
         tp = ds.target_projects()
         if tp.empty:
             print("[エラー] ステータス=予測対象 の案件がありません。--target で指定してください。")
             return 1
-        target = str(tp.iloc[0]["案件ID"])
+        targets = [str(v) for v in tp["案件ID"]]
+    if a.out and len(targets) > 1:
+        raise ValueError(
+            f"--out は予測対象が1件のときだけ指定できます(対象 {len(targets)} 件: "
+            f"{', '.join(targets)})。出力先を変えるなら --out-dir を使ってください。")
 
-    # 着手前の案件は実績が1行も無く、分かっているのは要素別の見積もりだけになる。
-    # 見積もりがあればそれをグループ別総量の正とし、無ければ契約人月を学習比率で割る。
-    est = {} if a.ignore_estimates else ds.estimates_of(target)
-    excl = [s.strip() for s in (a.exclude_group or "").split(";") if s.strip()]
-    fc = forecast(model, ds, target, group_totals=est or None, exclude_groups=excl,
-                  ramp_limit=ramp_all)
-
-    src = "見積もり(estimates)" if est else "契約人月 + 学習比率"
-    print(f"[4/5] 予測      {target} {fc.name}  "
-          f"{fc.months[0]}〜{fc.months[-1]} ({len(fc.months)}ヶ月) / "
-          f"{fc.total_hours:,.0f} 時間 = {fc.total_hours/hpm:,.0f} 人月")
-    print(f"                総量の根拠: {src} / 行程グループ {len(fc.groups)}/{len(groups)}")
-    dropped = [g for g in groups if g not in fc.groups]
-    if dropped:
-        print(f"                予測から除外: {', '.join(dropped)}")
-
-    # 予測対象が進行中なら、同じ月軸・同じ集計で実績を並べて比較できるようにする。
-    actual_table = project_monthly(agg, target, fc.months, fc.groups)
-
-    # --- 段階予測 ---
-    # 案件は普通、途中まで進んだ状態で「残りはどうなるか」を問われる。
-    # 完了案件でそれを再現すれば、予測が当たっているかを案件の完了を待たずに測れる。
-    basis = BASIS_SCALED if a.remain_basis == "scaled" else BASIS_FIXED
-    has_actual = actual_table is not None and not actual_table.empty \
-        and float(actual_table.to_numpy().sum()) > 0
-    has_ms = not ds.milestones_of(target).empty
-    want_phased = a.phased == "on" or (a.phased == "auto" and has_actual and has_ms)
-    phased = None
-    if want_phased:
-        try:
-            phased = phased_forecast(
-                ds, curves, groups, agg, target, align=align, n_bin=n_bin,
-                backbone_spec=backbone_spec, backbone_coverage=coverage,
-                hours_per_mm=hpm, recon=recon, warp_strength=warp_strength,
-                max_stretch=max_stretch, basis=basis, ramp_limit=ramp_spec,
-                group_totals=est or None, exclude_groups=excl)
-        except ValueError as e:
-            # 段階予測はあくまで検証用の付録。ここで落ちても本体の予測は出す。
-            msg = f"段階予測は作れませんでした: {e}"
-            print(f"[警告] {msg}")
-            warnings.append(msg)
-    elif a.phased == "auto" and not (has_actual and has_ms):
-        lack = "実績" if not has_actual else "マイルストーン"
-        print(f"        段階予測  {target} には{lack}が無いため出力しない"
-              "(--phased on で強制)")
-
-    if phased is not None:
-        lim = (f"{phased.ramp_limit:.2f} 倍/月" if phased.ramp_limit else "なし")
-        print(f"        段階予測  {len(phased.stages)} 段階 / 残工数の決め方: {basis}"
-              f" / 立ち上がり上限: {lim}")
-        for _, r in phased.metrics.iterrows():
-            w = r["残り月次WAPE"]
-            print(f"    段階{int(r['段階'])} {str(r['区切り']):<12} "
-                  f"確定 {int(r['確定月数']):>2}ヶ月 → 残り {int(r['残り月数']):>2}ヶ月  "
-                  f"月次WAPE {w if w is None else f'{w:.3f}'}   "
-                  f"残り総量誤差 {r['残り総量誤差(%)']:+.1f}%")
-        warnings.extend(phased.warnings)
-
-    # --- 検証 ---
+    # --- 検証(対象案件に依存しないので1回だけ) ---
     if a.no_validate:
         import pandas as pd
         detail = monthly = summary = pd.DataFrame()
-        print("[5/5] 検証      スキップ")
+        print("[4/5] 検証      スキップ")
     else:
         recons = (recon,) if a.no_compare_recon else RECON_MODES
         detail, monthly, summary = leave_one_out(
@@ -339,24 +337,19 @@ def _run(argv=None) -> int:
             backbone_coverage=coverage, hours_per_mm=hpm, recons=recons,
             warp_strength=warp_strength, max_stretch=max_stretch,
             ramp_limit=ramp_all)
-        print("[5/5] 検証      leave-one-out 完了")
-        print()
+        print("[4/5] 検証      leave-one-out 完了")
         for _, r in summary.iterrows():
             imp = r.get("素朴版比_改善率", 0.0)
             print(f"    {r['モード']:<22} 月次誤差WAPE {r['月次誤差WAPE_平均']:.3f}"
                   f"   累積乖離 {r['累積カーブ最大乖離_平均']:.3f}"
                   f"   素朴版比 {imp:+.1%}")
-        print()
 
-    # --- 出力 ---
-    out = a.out or os.path.join(
-        ROOT, "output",
-        f"forecast_{target}_align-{'on' if align else 'off'}_{ds.group_col}.xlsx")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-
-    params = {
+    # --- 予測と出力(予測対象ごと) ---
+    print(f"[5/5] 予測      対象 {len(targets)} 件: {', '.join(targets)}")
+    excl = [s.strip() for s in (a.exclude_group or "").split(";") if s.strip()]
+    out_dir = a.out_dir or os.path.join(ROOT, "output")
+    base_params = {
         "実行日時": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "予測対象": f"{target}  {fc.name}",
         "マスタ": ds.source.get("master", ""),
         "実績データ": ds.source.get("actuals", ""),
         "集約軸": ds.group_col,
@@ -369,29 +362,162 @@ def _run(argv=None) -> int:
         "カーブ復元": recon,
         "カーブ解像度": n_bin,
         "人月換算係数": hpm,
-        "学習案件数": len(curves),
-        "総量の根拠": src,
-        "予測した行程グループ": ", ".join(fc.groups),
-        "除外した行程グループ": ", ".join(dropped) or "(なし)",
-        "段階予測": (f"{len(phased.stages)} 段階 / 残工数の決め方: {phased.basis}"
-                     if phased is not None else "(出力なし)"),
-        "立ち上がり上限": (
-            f"{ramp_all:.2f} 倍/月(全期間予測・検証にも適用)" if ramp_all
-            else (f"{phased.ramp_limit:.2f} 倍/月(段階予測のみ)"
-                  if phased is not None and phased.ramp_limit else "使用しない")),
+        "段階予測のマイルストーン": ms_mode,
         "実装範囲": "実装順序 1〜2(素朴版 + マイルストーン位置合わせ) + 見積もりによる総量指定",
         "未使用パラメータ": f"k={ds.settings['k']}, タグ重み係数={ds.settings['タグ重み係数']} "
                             f"(実装順序 3・4 で使用予定)",
     }
 
+    # 同名の案件があるとファイルが上書きされ、片方が黙って消える。
+    # 名称が衝突する案件だけ案件IDを添える。
+    stems: dict[str, list[str]] = {}
+    for t in targets:
+        stems.setdefault(safe_filename(ds.project(t)["名称"], t), []).append(t)
+
+    written = []
+    for target in targets:
+        try:
+            # 対象が学習データに入っていれば、その案件だけを外して学習し直す。
+            if target in curves:
+                sub = {p_: c for p_, c in curves.items() if p_ != target}
+                if len(sub) < 2:
+                    raise ValueError(
+                        f"{target} を学習から外すと学習案件が {len(sub)} 件しか残りません。")
+                t_model, t_naive = learn_pair(sub)
+                t_curves = sub
+                print(f"    ({target} は完了案件のため、自分を除いた {len(sub)} 件で学習し直し)")
+            else:
+                t_model, t_naive, t_curves = model, model_naive, curves
+
+            path = _run_one(
+                target, ds=ds, agg=agg, model=t_model, model_naive=t_naive,
+                curves=t_curves, groups=groups, align=align, n_bin=n_bin,
+                backbone_spec=backbone_spec, coverage=coverage, hpm=hpm,
+                recon=recon, warp_strength=warp_strength, max_stretch=max_stretch,
+                ramp_spec=ramp_spec, ramp_all=ramp_all, ms_mode=ms_mode,
+                basis=BASIS_SCALED if a.remain_basis == "scaled" else BASIS_FIXED,
+                excl=excl, args=a, base_warnings=warnings, base_params=base_params,
+                detail=detail, monthly=monthly, summary=summary,
+                out_dir=out_dir, stems=stems)
+        except (ValueError, KeyError) as e:
+            # 1件の不備で残りの案件まで出せなくなるのは困る。落として続ける。
+            print(f"    [中断] {target}: {e}")
+            continue
+        written.append(path)
+
+    print()
+    for path in written:
+        print(f"出力: {path}")
+    if not written:
+        print("[エラー] 出力できた案件がありません。")
+        return 1
+    if len(written) < len(targets):
+        print(f"({len(targets) - len(written)} 件は上記の理由で出力できませんでした)")
+    print(f"所要: {time.time() - t0:.1f} 秒")
+    return 0
+
+
+def _run_one(target, *, ds, agg, model, model_naive, curves, groups, align, n_bin,
+             backbone_spec, coverage, hpm, recon, warp_strength, max_stretch,
+             ramp_spec, ramp_all, ms_mode, basis, excl, args, base_warnings,
+             base_params, detail, monthly, summary, out_dir, stems) -> str:
+    """1案件分の予測・段階予測・Excel出力。戻り値は書き出したパス。
+
+    学習・検証は呼び出し側で1回だけ行い、ここでは対象案件に依存する部分だけを行う。
+    警告は案件ごとに独立させる(前の案件の警告が次の案件のシートに混ざらないように)。
+    """
+    warnings = list(base_warnings)
+    if target not in curves and target in {str(p_) for p_ in ds.projects["案件ID"]} \
+            and str(ds.project(target).get("ステータス", "")).strip() == "完了":
+        warnings.append(
+            f"{target} は完了案件のため、自分自身を学習から外した {len(curves)} 件で"
+            "学習し直している(自分の実績で学習したカーブで自分を予測すると評価にならない)。"
+            "「予測」シートの数字は、全案件で学習した場合とは一致しない。")
+
+    # 着手前の案件は実績が1行も無く、分かっているのは要素別の見積もりだけになる。
+    # 見積もりがあればそれをグループ別総量の正とし、無ければ契約人月を学習比率で割る。
+    est = {} if args.ignore_estimates else ds.estimates_of(target)
+    fc = forecast(model, ds, target, group_totals=est or None, exclude_groups=excl,
+                  ramp_limit=ramp_all)
+
+    src = "見積もり(estimates)" if est else "契約人月 + 学習比率"
+    print(f"    {target} {fc.name}  {fc.months[0]}〜{fc.months[-1]} "
+          f"({len(fc.months)}ヶ月) / {fc.total_hours:,.0f} 時間 "
+          f"= {fc.total_hours / hpm:,.0f} 人月  [{src}]")
+    dropped = [g for g in groups if g not in fc.groups]
+    if dropped:
+        print(f"        予測から除外: {', '.join(dropped)}")
+
+    # 予測対象が進行中なら、同じ月軸・同じ集計で実績を並べて比較できるようにする。
+    actual_table = project_monthly(agg, target, fc.months, fc.groups)
+
+    # --- 段階予測 ---
+    # 案件は普通、途中まで進んだ状態で「残りはどうなるか」を問われる。
+    # 完了案件でそれを再現すれば、予測が当たっているかを案件の完了を待たずに測れる。
+    has_actual = actual_table is not None and not actual_table.empty \
+        and float(actual_table.to_numpy().sum()) > 0
+    has_ms = not ds.milestones_of(target).empty
+    want_phased = args.phased == "on" or (args.phased == "auto" and has_actual and has_ms)
+    phased = None
+    if want_phased:
+        try:
+            phased = phased_forecast(
+                ds, curves, groups, agg, target, align=align, n_bin=n_bin,
+                backbone_spec=backbone_spec, backbone_coverage=coverage,
+                hours_per_mm=hpm, recon=recon, warp_strength=warp_strength,
+                max_stretch=max_stretch, basis=basis, milestone_mode=ms_mode,
+                ramp_limit=ramp_spec, group_totals=est or None, exclude_groups=excl)
+        except ValueError as e:
+            # 段階予測はあくまで検証用の付録。ここで落ちても本体の予測は出す。
+            msg = f"段階予測は作れませんでした: {e}"
+            print(f"        [警告] {msg}")
+            warnings.append(msg)
+    elif args.phased == "auto" and not (has_actual and has_ms):
+        lack = "実績" if not has_actual else "マイルストーン"
+        print(f"        段階予測なし({lack}が無い。--phased on で強制)")
+
+    if phased is not None:
+        lim = f"{phased.ramp_limit:.2f} 倍/月" if phased.ramp_limit else "なし"
+        n_al = sum(1 for st in phased.stages if st.aligned_milestones)
+        print(f"        段階予測 {len(phased.stages)} 段階 / 残工数: {basis} / "
+              f"立ち上がり上限: {lim} / MS: {phased.milestone_mode} / "
+              f"位置合わせが効いた段階 {n_al}/{len(phased.stages)}")
+        for _, r in phased.metrics.iterrows():
+            w = r["残り月次WAPE"]
+            print(f"          段階{int(r['段階'])} {str(r['区切り']):<12} "
+                  f"確定 {int(r['確定月数']):>2}ヶ月 → 残り {int(r['残り月数']):>2}ヶ月  "
+                  f"月次WAPE {w if w is None else f'{w:.3f}'}   "
+                  f"残り総量誤差 {r['残り総量誤差(%)']:+.1f}%")
+        warnings.extend(phased.warnings)
+
+    # --- 出力 ---
+    # ファイル名は案件IDではなく名称にする。関係者に渡すのは名称であって
+    # IDではないため、受け取った側がどの案件か分かる形にしておく。
+    stem = safe_filename(ds.project(target)["名称"], target)
+    if len(stems.get(stem, [])) > 1:
+        stem = f"{stem}_{target}"     # 同名の案件があるので案件IDで区別する
+    out = args.out or os.path.join(
+        out_dir, f"{stem}_align-{'on' if align else 'off'}_{ds.group_col}.xlsx")
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+
+    params = dict(base_params)
+    params["予測対象"] = f"{target}  {fc.name}"
+    params["学習案件数"] = len(curves)
+    params["総量の根拠"] = src
+    params["予測した行程グループ"] = ", ".join(fc.groups)
+    params["除外した行程グループ"] = ", ".join(dropped) or "(なし)"
+    params["段階予測"] = (f"{len(phased.stages)} 段階 / 残工数の決め方: {phased.basis}"
+                          if phased is not None else "(出力なし)")
+    params["立ち上がり上限"] = (
+        f"{ramp_all:.2f} 倍/月(全期間予測・検証にも適用)" if ramp_all
+        else (f"{phased.ramp_limit:.2f} 倍/月(段階予測のみ)"
+              if phased is not None and phased.ramp_limit else "使用しない"))
+
     write_workbook(out, fc=fc, model=model, model_naive=model_naive, curves=curves,
                    ds=ds, detail=detail, monthly=monthly, summary=summary,
                    params=params, warnings=warnings, actual_table=actual_table,
                    phased=phased)
-
-    print(f"出力: {out}")
-    print(f"所要: {time.time() - t0:.1f} 秒")
-    return 0
+    return out
 
 
 if __name__ == "__main__":

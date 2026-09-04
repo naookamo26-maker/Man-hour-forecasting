@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.data_loader import load_all
 from src.learning import aggregate_actuals, build_project_curves, group_names
-from src.phased import BASIS_MODES, phased_forecast
+from src.phased import BASIS_MODES, MS_ALL, MS_MODES, MS_PASSED, phased_forecast
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -43,6 +43,8 @@ def parse_args(argv=None):
     p.add_argument("--align", choices=["on", "off"], default=None)
     p.add_argument("--basis", choices=["fixed", "scaled", "both"], default="both",
                    help="残工数の決め方。既定は両方を並べる")
+    p.add_argument("--milestones", choices=["すべて", "通過済み", "compare"], default=None,
+                   help="マイルストーンをどこまで既知とするか。compare で上限・下限を並べる")
     p.add_argument("--ramp-limit", default=None,
                    help="立ち上がり上限。自動(既定) / 数値 / off。"
                         "compare を指定すると 制約あり・なし を並べて比較する")
@@ -72,6 +74,13 @@ def main(argv=None) -> int:
     bases = BASIS_MODES if a.basis == "both" else \
         (BASIS_MODES[0],) if a.basis == "fixed" else (BASIS_MODES[1],)
 
+    if a.milestones == "compare":
+        ms_modes = [MS_ALL, MS_PASSED]
+    elif a.milestones:
+        ms_modes = [a.milestones]
+    else:
+        ms_modes = [str(ds.settings["段階予測のマイルストーン"]).strip()]
+
     raw = a.ramp_limit
     if raw == "compare":
         ramps = [("制約なし", None), ("立ち上がり上限", "自動")]
@@ -83,11 +92,13 @@ def main(argv=None) -> int:
         ramps = [(f"上限 {raw}", float(raw))]
 
     rows = []
-    for rlab, rlim in ramps:
-      for basis in bases:
+    for msm in ms_modes:
+      for rlab, rlim in ramps:
+       for basis in bases:
         for pid in sorted(curves):
             ph = phased_forecast(
                 ds, curves, groups, agg, pid, align=align, ramp_limit=rlim,
+                milestone_mode=msm,
                 n_bin=int(ds.settings["カーブ解像度"]),
                 backbone_spec=str(ds.settings["背骨マイルストーン"]),
                 backbone_coverage=float(ds.settings["背骨最小カバー率"]),
@@ -96,6 +107,7 @@ def main(argv=None) -> int:
             n_month = len(ph.months)
             for _, r in ph.metrics.iterrows():
                 rows.append({
+                    "マイルストーン": msm,
                     "立ち上がり": rlab,
                     "残工数の決め方": basis,
                     "案件ID": pid,
@@ -109,6 +121,7 @@ def main(argv=None) -> int:
                     "累積カーブ最大乖離": r["累積カーブ最大乖離"],
                     "残りが全体に占める割合(%)": r["残りが全体に占める割合(%)"],
                     "立上り制約に当たった月数": r["立上り制約に当たった月数"],
+                    "位置合わせに使ったMS数": r["位置合わせに使ったMS数"],
                 })
     d = pd.DataFrame(rows)
 
@@ -119,6 +132,19 @@ def main(argv=None) -> int:
     print("評価は残り区間だけで行う(確定分は実績そのもので誤差0のため)。")
     print("段階が進む = 確定が増える につれて誤差が下がっていれば、")
     print("予測は追加された実績を正しく使えている。")
+
+    if len(ms_modes) > 1:
+        print("\n■ マイルストーンをどこまで既知とするか(残り月次WAPE の平均)")
+        print("  すべて = 予定が完璧に当たった場合(上限) / 通過済み = 予定を何も持たない場合(下限)")
+        cmp_m = (d.pivot_table(index="確定区分", columns="マイルストーン", values="残り月次WAPE",
+                               aggfunc="mean", observed=True)
+                   .reindex(["0% (着手前)", "〜25%", "〜50%", "〜75%", "75%超"])
+                   .dropna(how="all").round(3))
+        print(cmp_m.to_string())
+        al = d.groupby("マイルストーン")["位置合わせに使ったMS数"].apply(lambda s_: (s_ > 0).mean())
+        print("\n  位置合わせが効いた段階の割合:")
+        print("   " + al.round(3).to_string().replace("\n", "\n   "))
+        d = d[d["マイルストーン"] == ms_modes[0]]
 
     if len(ramps) > 1:
         print("\n■ 立ち上がり上限の効果(残り月次WAPE の平均)")
