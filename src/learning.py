@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from .elasticity import deflate
 from .timeaxis import (RECON_BOX, Warp, date_to_t, month_edges, month_list,
                        monthly_to_canonical, t_to_date)
 
@@ -329,6 +330,10 @@ class Model:
     recon: str = RECON_BOX     # 月次から月内分布を復元する方式
     warp_strength: float = 1.0     # 位置合わせの強さ(0=なし / 1=実位置ちょうど)
     max_stretch: float | None = None   # 区間ごとの伸縮率の上限。跳ねの高さの上限になる
+    interval_elasticity: float = 0.0
+    # 区間の工数配分を区間長へ歩み寄らせる度合い(0=案A・既定 / 1=時間比例)。
+    # ここが 0 より大きいとき、この形状カーブは各案件から区間長の影響を
+    # 抜いたうえで平均されている(src/elasticity.py)。予測側で入れ直す。
     group_sample_n: dict[str, int] = field(default_factory=dict)
     # 行程グループ -> その形状カーブの学習に参加した案件数。
     # そのグループの業務が一切ない案件は形状の平均に参加しないため、
@@ -369,7 +374,8 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
           hours_per_mm: float = 160.0,
           recon: str = RECON_BOX,
           warp_strength: float = 1.0,
-          max_stretch: float | None = None) -> Model:
+          max_stretch: float | None = None,
+          interval_elasticity: float = 0.0) -> Model:
     """案件カーブ群から予測モデルを学習する。
 
     align=False なら素朴版(経過期間比のまま単純平均)、
@@ -378,6 +384,12 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
     warp_strength / max_stretch は位置合わせの効かせ具合。
     学習と予測で同じ値を使わないと、貼り付ける座標系が学習時とずれるため、
     ここで受け取った値を Model に載せて forecast() へ引き渡す。
+
+    interval_elasticity は「学習データより狭く潰れた区間への配分を減らす」度合い
+    (設計書 3-1-2)。0 が既定で、そのときこの関数の挙動は従来と1ビットも変わらない。
+    0 より大きいときは、各案件の形状から潰れの影響を抜いてから平均する
+    (src/elasticity.py の deflate)。予測側の inflate と対になっていて、
+    どちらか片方だけを効かせると補正が二重にかかる。
     """
     if not curves:
         raise ValueError("学習に使える案件がありません。")
@@ -422,6 +434,9 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
                 continue  # その案件に存在しないグループは平均に参加しない
             can = monthly_to_canonical(monthly, c.edges, c.warp, n_bin, recon=recon)
             can = can / can.sum()          # 案件規模で重み付けしないよう正規化
+            # 区間弾力性を使うときは、その案件の区間長による偏りをここで抜く。
+            # 抜かずに平均すると、予測側で区間長を効かせたときに二重にかかる。
+            can = deflate(can, c.warp, interval_elasticity)
             w = weights.get(pid, 1.0)
             acc += can * w
             wsum += w
@@ -436,7 +451,8 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
     for pid, c in curves.items():
         tot = c.monthly.sum(axis=1).to_numpy()
         can = monthly_to_canonical(tot, c.edges, c.warp, n_bin, recon=recon)
-        project_shapes[pid] = can / can.sum()
+        # 平均カーブと並べて見せるシートなので、平均側と同じ変換を通しておく。
+        project_shapes[pid] = deflate(can / can.sum(), c.warp, interval_elasticity)
 
     # --- Step 5: マイルストーン位置分布 ---
     rows = []
@@ -476,7 +492,8 @@ def learn(curves: dict[str, ProjectCurve], groups: list[str], *,
                  ms_stats=ms_stats, backbone=backbone, canonical_anchor=canonical_anchor,
                  contributors=contributors, align=align, project_shapes=project_shapes,
                  hours_per_mm=hours_per_mm, group_sample_n=group_sample_n,
-                 recon=recon, warp_strength=warp_strength, max_stretch=max_stretch)
+                 recon=recon, warp_strength=warp_strength, max_stretch=max_stretch,
+                 interval_elasticity=interval_elasticity)
 
 
 def group_names(agg: pd.DataFrame, phase_map: pd.DataFrame, group_col: str) -> list[str]:
