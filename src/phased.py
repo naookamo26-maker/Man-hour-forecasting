@@ -224,6 +224,7 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
                     backbone_spec: str = "自動", backbone_coverage: float = 0.6,
                     hours_per_mm: float = 160.0, recon: str = RECON_BOX,
                     warp_strength: float = 1.0, max_stretch: float | None = None,
+                    interval_elasticity: float = 0.0,
                     basis: str = BASIS_FIXED,
                     milestone_mode: str = MS_ALL,
                     ramp_limit: float | str | None = LIMIT_AUTO,
@@ -272,7 +273,8 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
     model = learn(rest, groups, align=align, n_bin=n_bin,
                   backbone_spec=backbone_spec, backbone_coverage=backbone_coverage,
                   hours_per_mm=hours_per_mm, recon=recon,
-                  warp_strength=warp_strength, max_stretch=max_stretch)
+                  warp_strength=warp_strength, max_stretch=max_stretch,
+                  interval_elasticity=interval_elasticity)
 
     # 月軸は「予測に使う軸」に揃える。実績側もこの軸に載せる。
     base = forecast(model, ds, pid, group_totals=group_totals,

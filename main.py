@@ -31,6 +31,7 @@ from src.learning import (aggregate_actuals, build_project_curves, group_names,
                           learn, project_monthly)
 from src.phased import (BASIS_FIXED, BASIS_MODES, BASIS_SCALED, MS_ALL,
                         MS_MODES, MS_PASSED, phased_forecast)
+from src.elasticity import ELASTICITY_MAX
 from src.ramp import LIMIT_AUTO, observed_growth_limit
 from src.timeaxis import RECON_BOX, RECON_MODES, RECON_SMOOTH
 from src.validation import leave_one_out
@@ -83,6 +84,11 @@ def parse_args(argv=None):
     p.add_argument("--max-stretch", type=float, default=None,
                    help="時間軸の伸縮率の上限(倍)。例 1.5 なら区間の伸縮を 1/1.5〜1.5 倍に抑える。"
                         "0 または未指定で無制限")
+    p.add_argument("--interval-elasticity", type=float, default=None,
+                   help="学習データより狭く潰れたマイルストーン区間への工数配分を減らす度合い 0〜1。"
+                        "0=区間の工数比率を学習値のまま使う(既定・設計書 3-1 の案A) / "
+                        "1=区間が潰れたことによる工数密度の上昇を完全に打ち消す。"
+                        "マイルストーンの日付は動かない")
     p.add_argument("--exclude-group", default=None,
                    help="この案件が行わない行程グループを ; 区切りで指定し、予測から外す。"
                         "estimates シートに見積もりがある場合は、そちらが優先される")
@@ -149,6 +155,8 @@ def _run(argv=None) -> int:
         overrides["位置合わせ強度"] = a.warp_strength
     if a.max_stretch is not None:
         overrides["伸縮率上限"] = a.max_stretch
+    if a.interval_elasticity is not None:
+        overrides["区間弾力性"] = a.interval_elasticity
     if a.reconstruct:
         overrides["カーブ復元"] = RECON_BOX if a.reconstruct == "box" else RECON_SMOOTH
     if a.ramp_limit is not None:
@@ -176,6 +184,12 @@ def _run(argv=None) -> int:
         raise ValueError(
             f"伸縮率上限 は 1 より大きい値(例 1.5)か、無制限を表す 0 を指定してください"
             f"(指定値: {max_stretch_raw})")
+    elasticity = float(ds.settings["区間弾力性"])
+    if not 0.0 <= elasticity <= ELASTICITY_MAX:
+        raise ValueError(
+            f"区間弾力性 は 0〜{ELASTICITY_MAX:g} の範囲で指定してください"
+            f"(指定値: {elasticity})。1 で「区間が潰れたことによる密度上昇を"
+            "完全に打ち消す」ところまで届くため、それ以上に振る意味はありません。")
     if recon not in RECON_MODES:
         raise ValueError(f"カーブ復元 は {' / '.join(RECON_MODES)} のいずれか(指定値: {recon!r})")
 
@@ -236,7 +250,8 @@ def _run(argv=None) -> int:
         m = learn(subset, groups, align=align, n_bin=n_bin,
                   backbone_spec=backbone_spec, backbone_coverage=coverage,
                   hours_per_mm=hpm, recon=recon,
-                  warp_strength=warp_strength, max_stretch=max_stretch)
+                  warp_strength=warp_strength, max_stretch=max_stretch,
+                  interval_elasticity=elasticity)
         mn = (learn(subset, groups, align=False, n_bin=n_bin, hours_per_mm=hpm,
                     recon=recon) if align else None)
         return m, mn
@@ -336,7 +351,7 @@ def _run(argv=None) -> int:
             ds, curves, groups, n_bin=n_bin, backbone_spec=backbone_spec,
             backbone_coverage=coverage, hours_per_mm=hpm, recons=recons,
             warp_strength=warp_strength, max_stretch=max_stretch,
-            ramp_limit=ramp_all)
+            interval_elasticity=elasticity, ramp_limit=ramp_all)
         print("[4/5] 検証      leave-one-out 完了")
         for _, r in summary.iterrows():
             imp = r.get("素朴版比_改善率", 0.0)
@@ -359,6 +374,7 @@ def _run(argv=None) -> int:
         "マイルストーン精度": str(ds.settings["マイルストーン精度"]),
         "位置合わせ強度": warp_strength,
         "伸縮率上限": max_stretch or "無制限",
+        "区間弾力性": elasticity,
         "カーブ復元": recon,
         "カーブ解像度": n_bin,
         "人月換算係数": hpm,
@@ -394,6 +410,7 @@ def _run(argv=None) -> int:
                 curves=t_curves, groups=groups, align=align, n_bin=n_bin,
                 backbone_spec=backbone_spec, coverage=coverage, hpm=hpm,
                 recon=recon, warp_strength=warp_strength, max_stretch=max_stretch,
+                elasticity=elasticity,
                 ramp_spec=ramp_spec, ramp_all=ramp_all, ms_mode=ms_mode,
                 basis=BASIS_SCALED if a.remain_basis == "scaled" else BASIS_FIXED,
                 excl=excl, args=a, base_warnings=warnings, base_params=base_params,
@@ -419,7 +436,7 @@ def _run(argv=None) -> int:
 
 def _run_one(target, *, ds, agg, model, model_naive, curves, groups, align, n_bin,
              backbone_spec, coverage, hpm, recon, warp_strength, max_stretch,
-             ramp_spec, ramp_all, ms_mode, basis, excl, args, base_warnings,
+             elasticity, ramp_spec, ramp_all, ms_mode, basis, excl, args, base_warnings,
              base_params, detail, monthly, summary, out_dir, stems) -> str:
     """1案件分の予測・段階予測・Excel出力。戻り値は書き出したパス。
 
@@ -465,7 +482,8 @@ def _run_one(target, *, ds, agg, model, model_naive, curves, groups, align, n_bi
                 ds, curves, groups, agg, target, align=align, n_bin=n_bin,
                 backbone_spec=backbone_spec, backbone_coverage=coverage,
                 hours_per_mm=hpm, recon=recon, warp_strength=warp_strength,
-                max_stretch=max_stretch, basis=basis, milestone_mode=ms_mode,
+                max_stretch=max_stretch, interval_elasticity=elasticity,
+                basis=basis, milestone_mode=ms_mode,
                 ramp_limit=ramp_spec, group_totals=est or None, exclude_groups=excl)
         except ValueError as e:
             # 段階予測はあくまで検証用の付録。ここで落ちても本体の予測は出す。

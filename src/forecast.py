@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from .elasticity import describe as describe_elasticity, inflate
 from .learning import Model
 from .ramp import apply_ramp
 from .timeaxis import (Warp, canonical_to_monthly, date_to_t, month_edges,
@@ -209,7 +210,9 @@ def forecast(model: Model, ds, pid: str, *,
                 f"時間軸の伸縮率がアンカーの前後で最大 {warp.max_step_ratio:.1f} 倍変わります"
                 f"(最大密度倍率 {warp.max_density_gain:.1f} 倍)。"
                 "その境目の月に工数の跳ねが出ます。"
-                "settings の 位置合わせ強度 を下げるか 伸縮率上限 を設定すると抑えられます。")
+                "settings の 区間弾力性 を上げると、マイルストーンの日付を動かさないまま"
+                "狭い区間への配分を減らせます。位置合わせ強度 を下げる / 伸縮率上限 を"
+                "設定する方法もありますが、そちらは山の位置が日付からずれます。")
         if model.warp_strength < 1.0 or (model.max_stretch or 0) > 1.0:
             notes.append(
                 f"位置合わせを弱めて適用しています(位置合わせ強度 {model.warp_strength:g}"
@@ -224,10 +227,25 @@ def forecast(model: Model, ds, pid: str, *,
         warp = Warp.identity()
         notes.append("位置合わせ OFF(素朴版)。学習カーブをそのまま期間に貼っています。")
 
+    # --- Step 3b: 潰れた区間への配分を減らす(設計書 3-1 の弾力化) ---
+    # 学習データより極端に狭い区間は、案Aのままだと実在しない要員数を要求する。
+    # その区間の総量だけを削り、あふれた分を他の区間へ回す。
+    # 既定(0)では何も起きず、アンカーの位置は最後まで一切動かない。
+    lam = float(getattr(model, "interval_elasticity", 0.0) or 0.0)
+    if lam > 0 and not warp.is_identity:
+        blend = sum(model.shape[g] * float(gt[g]) for g in groups)
+        if blend.sum() > 0:
+            desc = describe_elasticity(blend / blend.sum(), warp, lam)
+            if desc:
+                notes.append(
+                    f"区間弾力性 {lam:g} により、学習データより狭く潰れた区間への"
+                    f"配分を減らしました({desc})。"
+                    "マイルストーンの日付とグループ別の総量は変えていません。")
+
     # --- Step 4: 月次への離散化と正規化 ---
     cols = {}
     for g in groups:
-        monthly = canonical_to_monthly(model.shape[g], edges, warp)
+        monthly = canonical_to_monthly(inflate(model.shape[g], warp, lam), edges, warp)
         s = monthly.sum()
         cols[g] = monthly / s * float(gt[g]) if s > 0 else np.zeros(len(months))
     table = pd.DataFrame(cols, index=pd.Index(months, name="月"))[groups]

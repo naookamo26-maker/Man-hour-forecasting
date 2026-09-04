@@ -15,13 +15,18 @@
     密度倍率      最も圧縮された区間で、学習カーブの山が縦に何倍に伸びるか。
     跳ね度        leave-one-out 予測の月次変化幅 ÷ 実績の月次変化幅。
                   1 を大きく超えていれば、実績には無い跳ねを作っている。
+                  区間弾力性は時間軸に触らないので 段差比・密度倍率 は動かない。
+                  効いているかはこの 跳ね度 と WAPE に出る。
     WAPE          月次の予測誤差。位置合わせが効いているかどうかの本体。
 
 跳ねている案件を特定したら、対処は3つ。
     1. その案件のマイルストーン日付が実態と合っているか確認する(入力ミスが一番多い)
-    2. settings の 位置合わせ強度 を下げる(1.0 → 0.7 など)。全案件に効く
-    3. settings の 伸縮率上限 を設定する(例 1.5)。跳ねの高さに直接上限をかける
-2・3 はマイルストーンちょうどに山を合わせるのを諦める代わりに跳ねを抑える取引なので、
+    2. settings の 区間弾力性 を上げる(例 0.5)。潰れた区間への配分そのものを減らす。
+       マイルストーンの日付は動かないので、山の位置は指定どおりに残る
+    3. settings の 位置合わせ強度 を下げる(1.0 → 0.7 など)。全案件に効く
+    4. settings の 伸縮率上限 を設定する(例 1.5)。跳ねの高さに直接上限をかける
+3・4 はマイルストーンちょうどに山を合わせるのを諦める代わりに跳ねを抑える取引で、
+2 は山の位置を保ったまま高さだけを削る。いずれも
 このスクリプトが出す WAPE を見て、精度が悪化しないことを確かめてから採用すること。
 """
 
@@ -53,12 +58,15 @@ def parse_args(argv=None):
                    help="比較する 位置合わせ強度 の一覧")
     p.add_argument("--max-stretch", type=float, default=None,
                    help="伸縮率上限も併せて試す場合に指定(例 1.5)")
+    p.add_argument("--elasticity", type=float, nargs="*", default=None,
+                   help="区間弾力性も併せて試す場合に指定(例 0.3 0.5)。"
+                        "潰れた区間への配分を減らす。マイルストーンの日付は動かない")
     p.add_argument("--top", type=int, default=10, help="表示する案件数")
     return p.parse_args(argv)
 
 
-def _run_one(ds, curves, groups, *, strength, max_stretch, n_bin, backbone_spec,
-             coverage, hpm) -> pd.DataFrame:
+def _run_one(ds, curves, groups, *, strength, max_stretch, elasticity, n_bin,
+             backbone_spec, coverage, hpm) -> pd.DataFrame:
     """leave-one-out で全案件を予測し、ワープの急峻さと跳ねを案件ごとに測る。"""
     rows = []
     for held in sorted(curves):
@@ -67,7 +75,8 @@ def _run_one(ds, curves, groups, *, strength, max_stretch, n_bin, backbone_spec,
             continue
         model = learn(rest, groups, align=True, n_bin=n_bin,
                       backbone_spec=backbone_spec, backbone_coverage=coverage,
-                      hours_per_mm=hpm, warp_strength=strength, max_stretch=max_stretch)
+                      hours_per_mm=hpm, warp_strength=strength,
+                      max_stretch=max_stretch, interval_elasticity=elasticity)
         fc = forecast(model, ds, held, use_given_milestones=True,
                       months_override=curves[held].months)
         act = curves[held].monthly
@@ -131,16 +140,21 @@ def main(argv=None) -> int:
     print("  ※ 記入件数が少ないほど平均位置そのものが不安定で、")
     print("     個々の案件をそこへ合わせる伸縮が極端になりやすい。")
 
-    combos = [(s, None) for s in a.strengths]
+    combos = [(s, None, 0.0) for s in a.strengths]
     if a.max_stretch:
-        combos += [(s, a.max_stretch) for s in a.strengths if s > 0]
+        combos += [(s, a.max_stretch, 0.0) for s in a.strengths if s > 0]
+    # 区間弾力性は時間軸を動かさないので、強度1.0(= 日付どおり)と組んで意味が出る。
+    for lam in (a.elasticity or []):
+        combos += [(1.0, None, lam)]
 
     summary = []
     first = None
-    for strength, cap in combos:
+    for strength, cap, lam in combos:
         d = _run_one(ds, curves, groups, strength=strength, max_stretch=cap,
-                     n_bin=n_bin, backbone_spec=backbone_spec, coverage=coverage, hpm=hpm)
-        label = f"強度 {strength:g}" + (f" / 上限 {cap:g}倍" if cap else "")
+                     elasticity=lam, n_bin=n_bin, backbone_spec=backbone_spec,
+                     coverage=coverage, hpm=hpm)
+        label = (f"強度 {strength:g}" + (f" / 上限 {cap:g}倍" if cap else "")
+                 + (f" / 弾力性 {lam:g}" if lam else ""))
         if first is None:
             first = (label, d)
         summary.append({
@@ -176,7 +190,9 @@ def main(argv=None) -> int:
     print(pd.DataFrame(summary).to_string(index=False))
     print()
     print("WAPE を悪化させずに 跳ね度・段差比 が下がる設定があれば、")
-    print("それを settings の 位置合わせ強度 / 伸縮率上限 に書き込むこと。")
+    print("それを settings の 区間弾力性 / 位置合わせ強度 / 伸縮率上限 に書き込むこと。")
+    print("※ 区間弾力性は時間軸を動かさないため 段差比 は変わらない。")
+    print("   効いているかどうかは 跳ね度 と WAPE で見ること。")
     return 0
 
 
