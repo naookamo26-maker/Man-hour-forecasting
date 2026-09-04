@@ -26,12 +26,17 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import sys
 
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.data_loader import SETTINGS_DOC  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -504,28 +509,17 @@ def build_master(projects_rows, ms_rows, precision: str = "月"):
                      "表記ゆれのある実績行程名は行を追加して同じ行程グループに寄せる。")
 
     # --- settings ---
+    # 行は src/data_loader.py の SETTINGS_DOC から作る。
+    # シートと既定値を別々に書くと、片方だけ更新されて食い違う。
     ws = wb.create_sheet("settings")
-    dfs = pd.DataFrame([
-        ("人月換算係数", 160, "1人月あたりの時間。出力に必ず明記される(設計書 4-3)"),
-        ("集約軸", "行程グループ", "phase_map のどの列で学習するか。大分類 に変えると粗い粒度になる"),
-        ("位置合わせ", "ON", "ON/OFF。マイルストーンによる landmark registration(設計書 5 Step3)"),
-        ("背骨マイルストーン", "自動", "位置合わせに使うマイルストーン名を ; 区切りで指定。自動=全案件共通のものを使う"),
-        ("背骨最小カバー率", 0.6, "この割合以上の案件が持つマイルストーンを背骨に採用する。1.0=全案件必須"),
-        ("マイルストーン精度", "月", "月 / 自動。既定の 月 は日付を月央に丸める。自動 は日まで書いた日付をそのまま使う"),
-        ("位置合わせ強度", 1.0, "0〜1。実位置を正準位置へ引き戻す割合。下げると時間軸の伸縮が緩み、工数の跳ねが減る"),
-        ("伸縮率上限", 0, "時間軸の伸縮率の上限(倍)。例 1.5。0=無制限。跳ねの高さに直接上限をかける"),
-        ("区間弾力性", 0, "0〜0.9。マイルストーン区間への工数配分を区間の長さへ歩み寄らせる度合い。"
-                          "0=区間の工数比率を学習値のまま使う(設計書 3-1 の案A)。"
-                          "上げるほど極端に狭い区間への配分が減る。マイルストーンの日付は動かない"),
-        ("マイルストーン最小件数", 3, "この件数未満の統計は参考値として警告する(設計書 11)"),
-        ("カーブ解像度", 100, "正準時間軸の分割数。学習カーブのビン数"),
-        ("k", 3, "種別重み w=n/(n+k)。第1版では未使用。実装順序 3 で使用する"),
-        ("タグ重み係数", 0.5, "タグ類似度の効き。第1版では未使用。実装順序 4 で使用する"),
-    ], columns=["パラメータ", "値", "説明"])
+    dfs = pd.DataFrame([{"区分": g, "パラメータ": name, "値": default, "説明": desc}
+                        for g, name, default, _cli, desc in SETTINGS_DOC])
     write_sheet(ws, dfs,
-                widths={"パラメータ": 24, "値": 16, "説明": 70},
+                widths={"区分": 12, "パラメータ": 24, "値": 18, "説明": 78},
                 input_cols={"値"},
-                note="【凡例】青字セルが手入力項目。k とタグ重み係数は設計書 9 の実装順序 3・4 で使用予定。"
+                note="【凡例】青字セルが手入力項目。空欄にすると既定値で動く。"
+                     "コマンドライン引数を渡した場合は、そちらがこのシートより優先される。"
+                     "区分=未使用 の k とタグ重み係数は設計書 9 の実装順序 3・4 で使用予定で、"
                      "第1版(素朴版+位置合わせ)では読み込むだけで計算に使わない。")
 
     return wb

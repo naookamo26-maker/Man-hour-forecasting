@@ -42,8 +42,8 @@ import os
 import numpy as np
 import pandas as pd
 
-from generate_sample_data import (HEADER_FILL, HEADER_FONT, PACE, beta_pdf,
-                                  month_edges_t, month_range, pace_names,
+from generate_sample_data import (HEADER_FILL, HEADER_FONT, PACE, SETTINGS_DOC,
+                                  beta_pdf, month_edges_t, month_range, pace_names,
                                   wide_projects_frame, write_sheet)
 from openpyxl import Workbook
 
@@ -328,24 +328,13 @@ def build_master(rows, ms_rows, out, precision="月"):
                 note="【凡例】行程 20 個 / 行程グループ 10 個。")
 
     ws = wb.create_sheet("settings")
-    write_sheet(ws, pd.DataFrame([
-        ("人月換算係数", 160, "1人月あたりの時間"),
-        ("集約軸", "行程グループ", "phase_map のどの列で学習するか"),
-        ("位置合わせ", "ON", "マイルストーンによる位置合わせ"),
-        ("背骨マイルストーン", "自動", "位置合わせに使うマイルストーン"),
-        ("背骨最小カバー率", 0.6, "この割合以上の案件が持つものを背骨に採用"),
-        ("マイルストーン精度", "月", "月 / 自動。既定の 月 は日付を月央に丸める"),
-        ("位置合わせ強度", 1.0, "0〜1。実位置を正準位置へ引き戻す割合。下げると跳ねが減る"),
-        ("伸縮率上限", 0, "時間軸の伸縮率の上限(倍)。0=無制限"),
-        ("区間弾力性", 0, "0〜0.9。狭い区間への工数配分を減らす度合い。0=学習値のまま(案A)"),
-        ("マイルストーン最小件数", 3, "この件数未満は参考値として警告"),
-        ("行程グループ最小件数", 3, "この件数未満のカーブは参考値として警告"),
-        ("カーブ解像度", 100, "正準時間軸の分割数"),
-        ("カーブ復元", "月内均等", "月内均等 / 単調補間"),
-        ("k", 3, "種別重み。第1版では未使用"),
-        ("タグ重み係数", 0.5, "タグ類似度。第1版では未使用"),
-    ], columns=["パラメータ", "値", "説明"]),
-        widths={"パラメータ": 24, "値": 16, "説明": 60}, input_cols={"値"})
+    # 行は src/data_loader.py の SETTINGS_DOC から作る(小さいサンプルと同じ)。
+    write_sheet(ws, pd.DataFrame([{"区分": g, "パラメータ": name, "値": default, "説明": desc}
+                                  for g, name, default, _cli, desc in SETTINGS_DOC]),
+                widths={"区分": 12, "パラメータ": 24, "値": 18, "説明": 78},
+                input_cols={"値"},
+                note="【凡例】青字セルが手入力項目。空欄にすると既定値で動く。"
+                     "コマンドライン引数を渡した場合は、そちらがこのシートより優先される。")
     wb.save(out)
 
 
