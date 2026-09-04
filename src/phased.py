@@ -34,6 +34,21 @@
 学習データに予測対象そのものが入っていると、自分の実績で学習した
 カーブで自分を予測することになり、評価にならない。
 このモジュールは対象案件を必ず学習から外した(leave-one-out)モデルを使う。
+
+── マイルストーンをどこまで既知とするか(段階予測のマイルストーン)
+
+  すべて    記入済みの日付をすべて使う(既定)。「予測」シートと同じ条件になり、
+            位置合わせが全段階で効く。実運用では着手前からマイルストーンの
+            予定が引かれているため、こちらが運用の実態に近い。
+            ただし完了案件を対象にすると、記入されているのは実績の日付なので、
+            予定が完璧に当たった場合に相当する。精度の上限を見ていることになる。
+  通過済み  その段階までに通過したマイルストーンの実日付だけを使う。
+            未来を一切覗かないぶん厳密だが、予定を何も持たない場合に相当し、
+            精度の下限になる。背骨に入らないマイルストーンしか通過していない
+            段階では位置合わせが効かず、素朴版と同じカーブになる。
+
+実運用の精度はこの2つの間に入る。どちらか一方が正しいのではなく、
+上限と下限として両方を見るのが正しい読み方になる。
 """
 
 from __future__ import annotations
@@ -47,6 +62,10 @@ from .forecast import forecast
 from .learning import ProjectCurve, learn
 from .ramp import LIMIT_AUTO, apply_ramp, observed_growth_limit
 from .timeaxis import RECON_BOX
+
+MS_ALL = "すべて"        # 記入済みの日付をすべて使う(「予測」シートと同じ条件)
+MS_PASSED = "通過済み"    # その段階で通過したものだけ。情報漏れなし
+MS_MODES = (MS_ALL, MS_PASSED)
 
 BASIS_FIXED = "契約総量固定"
 BASIS_SCALED = "実績スケール"
@@ -70,6 +89,10 @@ class Stage:
     # 1.0 なら学習カーブどおり。1 より大きいほど「確定分が学習カーブより少ない」ことを
     # 意味し、その差が残り区間へ上乗せされる = 切り替え点で工数が跳ねる。
     # 跳ねの高さはこの倍率そのものなので、グラフの段差を見たらまずここを見る。
+    aligned_milestones: list[str] = field(default_factory=list)
+    # 実際に時間軸の固定に使えたマイルストーン(= 背骨に入っていて、かつ日付が既知)。
+    # 空なら、その段階のカーブは位置合わせが効いておらず素朴版と同じ形になる。
+    # 「位置合わせ ON にしたのにグラフが素朴版に見える」ときはここを見る。
     ramp: dict = field(default_factory=dict)
     # 立ち上がり制約の診断。上限に当たった月数、境界段差の前後、山の移動量。
     notes: list[str] = field(default_factory=list)
@@ -89,6 +112,7 @@ class PhasedResult:
     eval_last: int              # 実績が存在する最後の月の位置。ここまでしか答え合わせできない
     stages: list[Stage]
     basis: str
+    milestone_mode: str         # マイルストーンをどこまで既知としたか
     ramp_limit: float | None    # 使った立ち上がり上限(前月比)。None = 制約なし
     series: pd.DataFrame        # 月 × 系列(実績 + 各段階)の合計時間
     metrics: pd.DataFrame       # 段階ごとの誤差
@@ -201,6 +225,7 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
                     hours_per_mm: float = 160.0, recon: str = RECON_BOX,
                     warp_strength: float = 1.0, max_stretch: float | None = None,
                     basis: str = BASIS_FIXED,
+                    milestone_mode: str = MS_ALL,
                     ramp_limit: float | str | None = LIMIT_AUTO,
                     group_totals: dict[str, float] | None = None,
                     exclude_groups: list[str] | None = None) -> PhasedResult:
@@ -211,6 +236,10 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
     """
     if basis not in BASIS_MODES:
         raise ValueError(f"残工数の決め方 は {' / '.join(BASIS_MODES)} のいずれか(指定値: {basis!r})")
+    if milestone_mode not in MS_MODES:
+        raise ValueError(
+            f"段階予測のマイルストーン は {' / '.join(MS_MODES)} のいずれか"
+            f"(指定値: {milestone_mode!r})")
 
     pid = str(pid)
     warnings: list[str] = []
@@ -281,7 +310,7 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
         _build_stage(model, ds, pid, idx=0, label="段階0 着手前", milestone="",
                      cut_idx=-1, cut_month=None, known=[], months=months,
                      groups=fgroups, actual=actual, basis=basis,
-                     ramp_limit=ramp_limit,
+                     milestone_mode=milestone_mode, ramp_limit=ramp_limit,
                      group_totals=group_totals, exclude_groups=exclude_groups)
     ]
     for i, (nm, date, ci) in enumerate(points, start=1):
@@ -291,7 +320,8 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
                          label=f"段階{i} {nm}後({months[ci]}まで確定)",
                          milestone=nm, cut_idx=ci, cut_month=months[ci],
                          known=known, months=months, groups=fgroups,
-                         actual=actual, basis=basis, ramp_limit=ramp_limit,
+                         actual=actual, basis=basis, milestone_mode=milestone_mode,
+                         ramp_limit=ramp_limit,
                          group_totals=group_totals, exclude_groups=exclude_groups))
 
     # 総工数の保存を実行時に確かめる。
@@ -328,13 +358,14 @@ def phased_forecast(ds, curves: dict[str, ProjectCurve], groups: list[str],
             "見込んだ総工数(時間)": round(st.total_hours, 1),
             "残工数の倍率(学習カーブ比)": round(st.remain_gain, 2),
             "立上り制約に当たった月数": int(st.ramp.get("制約に当たった月数", 0)),
+            "位置合わせに使ったMS数": len(st.aligned_milestones),
             **_metrics(st.monthly, act_m, st.n_fixed, eval_last),
         })
     metrics = pd.DataFrame(rows)
 
     return PhasedResult(pid=pid, name=base.name, months=months, groups=fgroups,
                         actual=actual, eval_last=eval_last, stages=stages, basis=basis,
-                        ramp_limit=ramp_limit,
+                        milestone_mode=milestone_mode, ramp_limit=ramp_limit,
                         series=series, metrics=metrics, warnings=warnings)
 
 
@@ -353,7 +384,7 @@ def _actual_table(agg: pd.DataFrame, pid: str, months: list[str],
 def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
                  cut_idx: int, cut_month: str | None, known: list[str],
                  months: list[str], groups: list[str], actual: pd.DataFrame,
-                 basis: str, ramp_limit: float | None,
+                 basis: str, milestone_mode: str, ramp_limit: float | None,
                  group_totals, exclude_groups) -> Stage:
     """1段階分を組み立てる。
 
@@ -362,11 +393,20 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
     出てきた月次カーブを 確定分 / 残り に切って、残りだけを使うこと。
     """
     n_fixed = cut_idx + 1
+    # None を渡すと記入済みの日付をすべて使う(=「予測」シートと同じ条件)。
+    # 集合を渡すと、その名前の日付だけを使う。
+    known_arg = None if milestone_mode == MS_ALL else (set(known) if idx > 0 else set())
     fc = forecast(model, ds, pid, use_given_milestones=True,
-                  known_milestones=set(known) if idx > 0 else set(),
+                  known_milestones=known_arg,
                   group_totals=group_totals, months_override=months,
                   exclude_groups=exclude_groups)
     notes = list(fc.notes)
+    # 背骨に入っていて、かつ日付が既知だったものだけが時間軸を固定できる。
+    # 通過済みのマイルストーンがあっても、それが背骨でなければワープは恒等のままになる。
+    ms = fc.milestones
+    given = set(ms.loc[ms["根拠"].astype(str).str.startswith("指定"), "マイルストーン名"]) \
+        if not ms.empty else set()
+    aligned = [nm for nm in model.backbone if nm in given] if model.align else []
 
     fixed = actual.iloc[:n_fixed]
     table = pd.DataFrame(0.0, index=pd.Index(months, name="月"), columns=groups)
@@ -464,16 +504,28 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
     total = float(table.to_numpy().sum())
 
     if idx == 0:
-        notes.insert(0, "実績を一切使わない全期間予測。マイルストーンの日付も使っていない"
-                        "(着手前に通過済みのマイルストーンは無いため)。"
-                        "「予測」シートは記入済みの日付をすべて使うので、その分だけ条件が違う。")
+        notes.insert(0, "実績を一切使わない全期間予測。")
     else:
         notes.insert(0, f"{months[0]}〜{cut_month} の {n_fixed} ヶ月を実績で確定し、"
                         f"残り {len(months) - n_fixed} ヶ月を予測している。")
+    if milestone_mode == MS_ALL:
+        notes.insert(1, "マイルストーンは記入済みの日付をすべて使っている"
+                        "(「予測」シートと同じ条件)。実運用では着手前から予定が"
+                        "引かれているため運用の実態に近いが、完了案件では記入値が"
+                        "実績の日付なので、予定が完璧に当たった場合に相当する。")
+    else:
         notes.insert(1, "使うマイルストーンは通過済みのものだけ: "
                         + (", ".join(known) if known else "(なし)")
-                        + "。先のマイルストーンの日付はその時点では分かっていないため渡さず、"
-                        "学習した平均位置を使う(渡すと未来を覗いた予測になり評価にならない)。")
+                        + "。先のマイルストーンの日付は渡さず学習した平均位置を使う。"
+                        "未来を一切覗かないぶん厳密だが、予定を何も持たない場合に相当する。")
+    if model.align and model.backbone and not aligned:
+        notes.append(
+            "この段階は時間軸の固定に使えるマイルストーンが1つも無いため、"
+            f"位置合わせが効かず素朴版と同じカーブになっている(背骨: {', '.join(model.backbone)})。"
+            + ("通過済みのマイルストーンだけを使う設定のため。"
+               "段階予測のマイルストーン を すべて にすると全段階で効く。"
+               if milestone_mode != MS_ALL else
+               "この案件のマイルストーン日付が背骨のどれにも記入されていない。"))
     if ramp_info.get("適用"):
         moved = ramp_info["ピーク位置 後"] - ramp_info["ピーク位置 前"]
         notes.append(
@@ -518,4 +570,4 @@ def _build_stage(model, ds, pid: str, *, idx: int, label: str, milestone: str,
     return Stage(idx=idx, label=label, milestone=milestone, cut_month=cut_month,
                  n_fixed=n_fixed, known_milestones=known, table=table,
                  pred_only=pred_only, total_hours=total, remain_gain=remain_gain,
-                 ramp=ramp_info, notes=notes)
+                 aligned_milestones=aligned, ramp=ramp_info, notes=notes)
