@@ -53,25 +53,91 @@ _REPEAT_SUFFIX = re.compile(
 # 「レビューに入った日」と「通過した日」は別の意味を持つので、別のマイルストーンとして扱う。
 FIRST_ATTEMPT_SUFFIX = "(初回)"
 
-DEFAULT_SETTINGS = {
-    "人月換算係数": 160.0,
-    "集約軸": "行程グループ",
-    "位置合わせ": "ON",
-    "背骨マイルストーン": "自動",
-    "背骨最小カバー率": 0.6,
-    "マイルストーン精度": "月",
-    "位置合わせ強度": 1.0,
-    "伸縮率上限": 0.0,
-    "区間弾力性": 0.0,
-    "マイルストーン最小件数": 3,
-    "行程グループ最小件数": 3,
-    "カーブ解像度": 100,
-    "カーブ復元": "月内均等",
-    "立ち上がり上限": "自動",
-    "段階予測のマイルストーン": "すべて",
-    "k": 3.0,
-    "タグ重み係数": 0.5,
-}
+# settings シートで指定できるパラメータの一覧。
+#   (区分, パラメータ名, 既定値, 対応するコマンドライン引数, 説明)
+# 既定値・master.xlsx の settings シート・README のパラメータ表が食い違うと、
+# 「引数にはあるがシートからは変えられない」設定が静かに増える。
+# ここを唯一の出どころにして、シートの生成(scripts/generate_sample_data.py)も
+# 既定値もこの表から作る。master.xlsx のパスだけは、それ自体を読むために
+# 必要なのでここには置けない(コマンドライン引数 --master 専用)。
+SETTINGS_DOC = [
+    # --- 入出力 ---
+    ("入出力", "実績CSV", "", "--actuals",
+     "実績CSVの場所。空欄ならマスタと同じフォルダの actuals.csv。"
+     "相対パスはマスタのフォルダ基準(引数 --actuals が優先)"),
+    ("入出力", "出力先フォルダ", "", "--out-dir",
+     "出力Excelを書き出すフォルダ。空欄なら output/(引数 --out-dir が優先)"),
+    ("入出力", "予測対象の案件ID", "", "--target",
+     "予測する案件を ; 区切りで指定する。空欄なら ステータス=予測対象 の案件をすべて出す。"
+     "完了案件を書けば、その案件で予測の当たり具合を確かめられる(引数 --target が優先)"),
+    # --- 学習 ---
+    ("学習", "人月換算係数", 160.0, "",
+     "1人月あたりの時間。出力に必ず明記される(設計書 4-3)"),
+    ("学習", "集約軸", "行程グループ", "--group-col",
+     "phase_map のどの列で学習するか。大分類 に変えると粗い粒度になる"),
+    ("学習", "位置合わせ", "ON", "--align",
+     "ON/OFF。マイルストーンによる landmark registration(設計書 5 Step3)"),
+    ("学習", "背骨マイルストーン", "自動", "--backbone",
+     "位置合わせに使うマイルストーン名を ; 区切りで指定。自動=全案件共通のものを使う"),
+    ("学習", "背骨最小カバー率", 0.6, "--backbone-coverage",
+     "この割合以上の案件が持つマイルストーンを背骨に採用する。1.0=全案件必須"),
+    ("学習", "マイルストーン精度", "月", "--ms-precision",
+     "月 / 自動。既定の 月 は日付を月央に丸める。自動 は日まで書いた日付をそのまま使う"),
+    ("学習", "位置合わせ強度", 1.0, "--warp-strength",
+     "0〜1。実位置を正準位置へ引き戻す割合。下げると時間軸の伸縮が緩み、工数の跳ねが減る。"
+     "ただしマイルストーンの山が指定日付からずれる"),
+    ("学習", "伸縮率上限", 0.0, "--max-stretch",
+     "時間軸の伸縮率の上限(倍)。例 1.5。0=無制限。跳ねの高さに直接上限をかける。"
+     "ただしマイルストーンの山が指定日付からずれる"),
+    ("学習", "区間弾力性", 0.0, "--interval-elasticity",
+     "0〜1。学習データより狭く潰れたマイルストーン区間への工数配分を減らす度合い。"
+     "0=区間の工数比率を学習値のまま使う(設計書 3-1 の案A)。"
+     "1=区間が潰れたことによる密度上昇を完全に打ち消す。マイルストーンの日付は動かない"),
+    ("学習", "カーブ解像度", 100, "--n-bin", "正準時間軸の分割数。学習カーブのビン数"),
+    ("学習", "カーブ復元", "月内均等", "--reconstruct",
+     "月内均等 / 単調補間。月次の値から月の内側の分布をどう復元するか(設計書 5 Step2)"),
+    # --- 予測 ---
+    ("予測", "見積もりを使う", "ON", "--ignore-estimates",
+     "ON/OFF。OFF にすると estimates シートを無視し、契約人月と学習比率だけで配分する"),
+    ("予測", "除外する行程グループ", "", "--exclude-group",
+     "この案件では行わない行程グループを ; 区切りで指定し、予測から外す。"
+     "estimates シートに見積もりがある場合はそちらが優先される"),
+    ("予測", "立ち上がり上限", "自動", "--ramp-limit",
+     "月次工数の増加率の上限(前月比)。自動=実績の前月比90%点から決める / 数値(例 1.3) / off=制約なし"),
+    ("予測", "立ち上がり上限の適用範囲", "段階予測のみ", "--ramp-scope",
+     "段階予測のみ / 全体 / なし。全体 にすると通常の予測と検証にも効く"),
+    # --- 段階予測 ---
+    ("段階予測", "段階予測", "自動", "--phased",
+     "自動 / ON / OFF。自動=実績とマイルストーンがある案件では出す"),
+    ("段階予測", "段階予測の残工数", "固定", "--remain-basis",
+     "固定 / 引き直す。固定=契約・見積もりの総量を動かさず 残り=総量-確定分 / "
+     "引き直す=確定分の実績から総量を推定し直す"),
+    ("段階予測", "段階予測のマイルストーン", "すべて", "--phased-milestones",
+     "すべて / 通過済み。すべて=記入済みの日付を全部使う(「予測」シートと同じ条件) / "
+     "通過済み=その段階までに通過したものだけ(未来を覗かない)"),
+    # --- 検証・実行 ---
+    ("検証・実行", "検証", "ON", "--no-validate",
+     "ON/OFF。leave-one-out で予測の当たり具合を測り、検証シートに出す。OFF にすると速い"),
+    ("検証・実行", "カーブ復元の比較", "ON", "--no-compare-recon",
+     "ON/OFF。検証で 月内均等 と 単調補間 を並べて出すか"),
+    ("検証・実行", "実績キャッシュ", "ON", "--no-cache",
+     "ON/OFF。実績CSVをparquetに読み込み済みとして再利用する。CSVを差し替えたら自動で作り直す"),
+    ("検証・実行", "マイルストーン最小件数", 3, "",
+     "この件数未満の統計は参考値として警告する(設計書 11)"),
+    ("検証・実行", "行程グループ最小件数", 3, "",
+     "この件数未満の案件からしか学習できていない行程グループを警告する"),
+    # --- 第1版では未使用 ---
+    ("未使用", "k", 3.0, "", "種別重み w=n/(n+k)。第1版では未使用。実装順序 3 で使用する"),
+    ("未使用", "タグ重み係数", 0.5, "", "タグ類似度の効き。第1版では未使用。実装順序 4 で使用する"),
+]
+
+DEFAULT_SETTINGS = {name: default for _, name, default, _, _ in SETTINGS_DOC}
+
+# 空欄で書かれたときに「空文字」を正としてよいパラメータ。
+# それ以外は空欄を「未記入」とみなし、DEFAULT_SETTINGS の値を残す。
+# 空欄が意味を持つ(= 指定なし)のはパス・案件ID・除外指定だけである。
+BLANK_OK = {"実績CSV", "出力先フォルダ", "予測対象の案件ID", "除外する行程グループ",
+            "背骨マイルストーン"}
 
 
 @dataclass
@@ -183,13 +249,27 @@ def _read_settings(path: str) -> dict:
     out = dict(DEFAULT_SETTINGS)
     for _, r in df.iterrows():
         key = str(r["パラメータ"]).strip()
+        if not key or key.startswith("【"):
+            continue          # 空行と凡例行
         val = r["値"]
-        if key in ("人月換算係数", "k", "タグ重み係数", "背骨最小カバー率"):
-            val = float(val)
-        elif key in ("マイルストーン最小件数", "行程グループ最小件数", "カーブ解像度"):
-            val = int(val)
-        else:
-            val = str(val).strip()
+        blank = val is None or (isinstance(val, float) and pd.isna(val)) \
+            or str(val).strip() in ("", "nan")
+        if blank:
+            # 未記入は既定値のまま。空文字が意味を持つものだけ空にする。
+            if key in BLANK_OK:
+                out[key] = ""
+            continue
+        try:
+            if key in ("人月換算係数", "k", "タグ重み係数", "背骨最小カバー率",
+                       "位置合わせ強度", "伸縮率上限", "区間弾力性"):
+                val = float(val)
+            elif key in ("マイルストーン最小件数", "行程グループ最小件数", "カーブ解像度"):
+                val = int(val)
+            else:
+                val = str(val).strip()
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"settings シートの {key} は数値で書いてください(記入値: {val!r})") from None
         out[key] = val
     return out
 
@@ -371,17 +451,45 @@ def _normalize_milestone_repeats(ms: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
             attempts, warnings)
 
 
-def load_all(master_path: str, actuals_path: str,
+def resolve_actuals_path(master_path: str, settings: dict) -> str:
+    """実績CSVの場所を決める。
+
+    settings の 実績CSV が空なら、master と同じフォルダの actuals.csv を見る。
+    相対パスで書かれていたら master のフォルダを基準に解く。データは
+    master と対で置かれるので、そこを基準にしたほうが移動に強い。
+    """
+    base = os.path.dirname(os.path.abspath(master_path))
+    raw = str(settings.get("実績CSV", "") or "").strip()
+    if not raw:
+        return os.path.join(base, "actuals.csv")
+    return raw if os.path.isabs(raw) else os.path.join(base, raw)
+
+
+def load_all(master_path: str, actuals_path: str | None = None,
              overrides: dict | None = None,
-             use_cache: bool = True) -> Dataset:
+             use_cache: bool | None = None) -> Dataset:
     """マスタと実績を読み込み、Dataset を返す。
 
     overrides で settings の値をコマンドラインから上書きできる。
+    actuals_path / use_cache は省略できる。省略した場合は settings の
+    実績CSV / 実績キャッシュ に従う(コマンドラインで渡せばそちらが優先)。
     """
     if not os.path.exists(master_path):
         raise FileNotFoundError(f"マスタが見つかりません: {master_path}")
+
+    # settings を先に読む。実績CSVの場所とキャッシュの可否がここで決まるため。
+    settings = _read_settings(master_path)
+    if overrides:
+        settings.update({k: v for k, v in overrides.items() if v is not None})
+    if actuals_path is None:
+        actuals_path = resolve_actuals_path(master_path, settings)
+    if use_cache is None:
+        use_cache = str(settings.get("実績キャッシュ", "ON")).strip().upper() != "OFF"
     if not os.path.exists(actuals_path):
-        raise FileNotFoundError(f"実績データが見つかりません: {actuals_path}")
+        raise FileNotFoundError(
+            f"実績データが見つかりません: {actuals_path}"
+            + ("（settings の 実績CSV で場所を指定できます）"
+               if not str(settings.get("実績CSV", "") or "").strip() else ""))
 
     projects = _read_table(master_path, "projects")
     projects["案件ID"] = projects["案件ID"].astype(str).str.strip()
@@ -398,10 +506,6 @@ def load_all(master_path: str, actuals_path: str,
     if "タグ" not in projects.columns:
         projects["タグ"] = ""
     projects["タグ"] = projects["タグ"].fillna("")
-
-    settings = _read_settings(master_path)
-    if overrides:
-        settings.update({k: v for k, v in overrides.items() if v is not None})
 
     # マイルストーンは projects シートの右側に列として書く形が本命。
     # 旧形式(別シート)も読めるようにしてあるので、移行の途中でも動く。

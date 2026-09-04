@@ -57,15 +57,54 @@ def safe_filename(name: str, fallback: str, limit: int = 80) -> str:
     return s or str(fallback)
 
 
+# コマンドラインの短い綴りと、settings シートの日本語表記の対応。
+# 引数は settings への上書きとして働くので、ここで表記を揃えてから overrides に入れる。
+CLI_PHASED = {"auto": "自動", "on": "ON", "off": "OFF"}
+CLI_BASIS = {"fixed": "固定", "scaled": "引き直す"}
+CLI_SCOPE = {"phased": "段階予測のみ", "all": "全体", "off": "なし"}
+
+BASIS_BY_NAME = {"固定": BASIS_FIXED, "引き直す": BASIS_SCALED}
+
+
+def _flag(settings: dict, key: str) -> bool:
+    """settings の ON/OFF を真偽値にする。"""
+    v = str(settings.get(key, "ON")).strip()
+    if v.upper() in ("ON", "TRUE", "1", "する", "はい"):
+        return True
+    if v.upper() in ("OFF", "FALSE", "0", "しない", "いいえ", "なし"):
+        return False
+    raise ValueError(
+        f"settings の {key} は ON / OFF のどちらかで書いてください(記入値: {v!r})")
+
+
+def _one_of(settings: dict, key: str, allowed: tuple[str, ...]) -> str:
+    """settings の値が選択肢のどれかであることを確かめる。ON/OFF は大小を吸収する。"""
+    v = str(settings.get(key, "")).strip()
+    if v.upper() in ("ON", "OFF") and v.upper() in allowed:
+        return v.upper()
+    if v not in allowed:
+        raise ValueError(
+            f"settings の {key} は {' / '.join(allowed)} のいずれかで書いてください"
+            f"(記入値: {v!r})")
+    return v
+
+
+def _id_list(raw) -> list[str]:
+    """', ' や ';' 区切りの案件ID・行程グループ名を配列にする。"""
+    return [x.strip() for x in re.split(r"[,;]", str(raw or "")) if x.strip()]
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="工数予測システム(第1版:素朴版+マイルストーン位置合わせ)")
     p.add_argument("--master", default=os.path.join(ROOT, "data", "master.xlsx"),
                    help="マスタExcelのパス")
-    p.add_argument("--actuals", default=os.path.join(ROOT, "data", "actuals.csv"),
-                   help="実績CSVのパス")
+    p.add_argument("--actuals", default=None,
+                   help="実績CSVのパス。省略時は settings の 実績CSV、"
+                        "それも空ならマスタと同じフォルダの actuals.csv")
     p.add_argument("--target", default=None,
                    help="予測対象の案件ID。, または ; 区切りで複数指定できる。"
-                        "省略時は ステータス=予測対象 の案件をすべて出力する")
+                        "省略時は settings の 予測対象の案件ID、"
+                        "それも空なら ステータス=予測対象 の案件をすべて出力する")
     p.add_argument("--align", choices=["on", "off"], default=None,
                    help="マイルストーン位置合わせ。省略時は settings の値")
     p.add_argument("--group-col", default=None,
@@ -89,22 +128,26 @@ def parse_args(argv=None):
                         "0=区間の工数比率を学習値のまま使う(既定・設計書 3-1 の案A) / "
                         "1=区間が潰れたことによる工数密度の上昇を完全に打ち消す。"
                         "マイルストーンの日付は動かない")
-    p.add_argument("--exclude-group", default=None,
+    p.add_argument("--exclude-group", default=None,  # settings: 除外する行程グループ
                    help="この案件が行わない行程グループを ; 区切りで指定し、予測から外す。"
                         "estimates シートに見積もりがある場合は、そちらが優先される")
     p.add_argument("--ignore-estimates", action="store_true",
-                   help="estimates シートの見積もりを使わず、契約人月と学習比率だけで予測する")
+                   help="estimates シートの見積もりを使わず、契約人月と学習比率だけで予測する"
+                        "(settings の 見積もりを使う を OFF にするのと同じ)")
     p.add_argument("--reconstruct", choices=["box", "smooth"], default=None,
                    help="月次から月内分布を復元する方式。box=月内均等(既定) / "
                         "smooth=累積の単調補間。省略時は settings の カーブ復元")
     p.add_argument("--no-compare-recon", action="store_true",
-                   help="検証で復元方式を比較しない(既定は両方式を並べて出す)")
-    p.add_argument("--phased", choices=["auto", "on", "off"], default="auto",
+                   help="検証で復元方式を比較しない(既定は両方式を並べて出す。"
+                        "settings の カーブ復元の比較 を OFF にするのと同じ)")
+    p.add_argument("--phased", choices=["auto", "on", "off"], default=None,
                    help="段階予測(マイルストーンごとに実績を確定させ、残りを予測)。"
-                        "auto=実績とマイルストーンがある案件では自動で出す")
+                        "auto=実績とマイルストーンがある案件では自動で出す。"
+                        "省略時は settings の 段階予測")
     p.add_argument("--remain-basis", choices=["fixed", "scaled"], default=None,
                    help="段階予測の残工数の決め方。fixed=契約・見積もりの総量を固定して"
-                        "残り=総量-確定分(既定) / scaled=確定分の実績から総量を引き直す")
+                        "残り=総量-確定分(既定) / scaled=確定分の実績から総量を引き直す。"
+                        "省略時は settings の 段階予測の残工数")
     p.add_argument("--phased-milestones", choices=["すべて", "通過済み"], default=None,
                    help="段階予測でマイルストーンをどこまで既知とするか。"
                         "すべて=記入済みの日付を全部使う(既定・「予測」シートと同じ条件) / "
@@ -112,15 +155,20 @@ def parse_args(argv=None):
     p.add_argument("--ramp-limit", default=None,
                    help="月次工数の増加率の上限(前月比)。自動=実績の前月比90%点から決める(既定) / "
                         "数値(例 1.3) / off=制約なし")
-    p.add_argument("--ramp-scope", choices=["phased", "all", "off"], default="phased",
+    p.add_argument("--ramp-scope", choices=["phased", "all", "off"], default=None,
                    help="立ち上がり上限をどこに効かせるか。phased=段階予測のみ(既定) / "
-                        "all=全期間予測と検証にも効かせる / off=使わない")
+                        "all=全期間予測と検証にも効かせる / off=使わない。"
+                        "省略時は settings の 立ち上がり上限の適用範囲")
     p.add_argument("--out", default=None,
                    help="出力Excelのパス。予測対象が1件のときだけ指定できる")
     p.add_argument("--out-dir", default=None,
-                   help="出力先ディレクトリ。既定は output/")
-    p.add_argument("--no-validate", action="store_true", help="leave-one-out を実行しない")
-    p.add_argument("--no-cache", action="store_true", help="実績のparquetキャッシュを使わない")
+                   help="出力先ディレクトリ。省略時は settings の 出力先フォルダ、"
+                        "それも空なら output/")
+    p.add_argument("--no-validate", action="store_true",
+                   help="leave-one-out を実行しない(settings の 検証 を OFF にするのと同じ)")
+    p.add_argument("--no-cache", action="store_true",
+                   help="実績のparquetキャッシュを使わない"
+                        "(settings の 実績キャッシュ を OFF にするのと同じ)")
     return p.parse_args(argv)
 
 
@@ -163,13 +211,37 @@ def _run(argv=None) -> int:
         overrides["立ち上がり上限"] = a.ramp_limit
     if a.phased_milestones is not None:
         overrides["段階予測のマイルストーン"] = a.phased_milestones
+    if a.actuals:
+        overrides["実績CSV"] = os.path.abspath(a.actuals)
+    if a.target:
+        overrides["予測対象の案件ID"] = a.target
+    if a.out_dir:
+        overrides["出力先フォルダ"] = a.out_dir
+    if a.exclude_group is not None:
+        overrides["除外する行程グループ"] = a.exclude_group
+    if a.phased is not None:
+        overrides["段階予測"] = CLI_PHASED[a.phased]
+    if a.remain_basis is not None:
+        overrides["段階予測の残工数"] = CLI_BASIS[a.remain_basis]
+    if a.ramp_scope is not None:
+        overrides["立ち上がり上限の適用範囲"] = CLI_SCOPE[a.ramp_scope]
+    # --no-* は「無効化」の一方向。settings で OFF にしたものを引数で ON には戻さない。
+    if a.no_validate:
+        overrides["検証"] = "OFF"
+    if a.no_compare_recon:
+        overrides["カーブ復元の比較"] = "OFF"
+    if a.ignore_estimates:
+        overrides["見積もりを使う"] = "OFF"
+    if a.no_cache:
+        overrides["実績キャッシュ"] = "OFF"
 
     print("=" * 72)
     print("工数予測システム(第1版:素朴版 + マイルストーン位置合わせ)")
     print("=" * 72)
 
     # --- 読み込み ---
-    ds = load_all(a.master, a.actuals, overrides=overrides, use_cache=not a.no_cache)
+    # 実績CSVの場所とキャッシュの可否は settings 側で解決される(引数があればそちらが勝つ)。
+    ds = load_all(a.master, overrides=overrides)
     align = str(ds.settings["位置合わせ"]).upper() == "ON"
     n_bin = int(ds.settings["カーブ解像度"])
     backbone_spec = str(ds.settings["背骨マイルストーン"])
@@ -193,10 +265,21 @@ def _run(argv=None) -> int:
     if recon not in RECON_MODES:
         raise ValueError(f"カーブ復元 は {' / '.join(RECON_MODES)} のいずれか(指定値: {recon!r})")
 
+    # 残りの実行設定。ここまでと同じく settings が既定で、引数が上書きしている。
+    phased_mode = _one_of(ds.settings, "段階予測", ("自動", "ON", "OFF"))
+    basis = BASIS_BY_NAME[_one_of(ds.settings, "段階予測の残工数", ("固定", "引き直す"))]
+    ramp_scope = _one_of(ds.settings, "立ち上がり上限の適用範囲",
+                         ("段階予測のみ", "全体", "なし"))
+    use_estimates = _flag(ds.settings, "見積もりを使う")
+    do_validate = _flag(ds.settings, "検証")
+    compare_recon = _flag(ds.settings, "カーブ復元の比較")
+    excl = _id_list(ds.settings["除外する行程グループ"])
+    out_dir = str(ds.settings["出力先フォルダ"] or "").strip() or os.path.join(ROOT, "output")
+
     # 立ち上がり上限。「自動」は学習データの前月比から決めるので、集約後でないと出せない。
     # ここでは指定値の解釈だけ行い、自動の解決は集約のあとで行う。
     raw_ramp = str(ds.settings["立ち上がり上限"]).strip()
-    if a.ramp_scope == "off" or raw_ramp.lower() in ("off", "なし", ""):
+    if ramp_scope == "なし" or raw_ramp.lower() in ("off", "なし", ""):
         ramp_spec = None
     elif raw_ramp == LIMIT_AUTO:
         ramp_spec = LIMIT_AUTO
@@ -214,6 +297,7 @@ def _run(argv=None) -> int:
     if ms_mode not in MS_MODES:
         raise ValueError(
             f"段階予測のマイルストーン は {' / '.join(MS_MODES)} のいずれか(指定値: {ms_mode!r})")
+
     hpm = ds.hours_per_mm
 
     print(f"[1/5] 読み込み  案件 {len(ds.projects)} 件 / 実績 {len(ds.actuals):,} 行 "
@@ -231,7 +315,7 @@ def _run(argv=None) -> int:
     # 全期間予測・検証に効かせる上限。段階予測は対象案件を学習から外した上で
     # 自前に決め直すため、ここで決めるのは scope=all のときに使う値になる。
     ramp_all = None
-    if ramp_spec is not None and a.ramp_scope == "all":
+    if ramp_spec is not None and ramp_scope == "全体":
         ramp_all = (observed_growth_limit([c.monthly.sum(axis=1).to_numpy()
                                            for c in curves.values()])
                     if ramp_spec == LIMIT_AUTO else float(ramp_spec))
@@ -323,8 +407,9 @@ def _run(argv=None) -> int:
     # --- 予測対象の決定 ---
     # 予測対象が複数あるのは普通のことなので、1回の実行で全部出す。
     # 学習と検証は対象案件に依存しないため、ここまでの結果をそのまま使い回す。
-    if a.target:
-        targets = [t.strip() for t in re.split(r"[,;]", a.target) if t.strip()]
+    targets_spec = _id_list(ds.settings["予測対象の案件ID"])
+    if targets_spec:
+        targets = targets_spec
         unknown = [t for t in targets if t not in ds.known_ids]
         if unknown:
             raise ValueError(
@@ -332,7 +417,8 @@ def _run(argv=None) -> int:
     else:
         tp = ds.target_projects()
         if tp.empty:
-            print("[エラー] ステータス=予測対象 の案件がありません。--target で指定してください。")
+            print("[エラー] ステータス=予測対象 の案件がありません。"
+                  "settings の 予測対象の案件ID か --target で指定してください。")
             return 1
         targets = [str(v) for v in tp["案件ID"]]
     if a.out and len(targets) > 1:
@@ -341,12 +427,12 @@ def _run(argv=None) -> int:
             f"{', '.join(targets)})。出力先を変えるなら --out-dir を使ってください。")
 
     # --- 検証(対象案件に依存しないので1回だけ) ---
-    if a.no_validate:
+    if not do_validate:
         import pandas as pd
         detail = monthly = summary = pd.DataFrame()
         print("[4/5] 検証      スキップ")
     else:
-        recons = (recon,) if a.no_compare_recon else RECON_MODES
+        recons = (recon,) if not compare_recon else RECON_MODES
         detail, monthly, summary = leave_one_out(
             ds, curves, groups, n_bin=n_bin, backbone_spec=backbone_spec,
             backbone_coverage=coverage, hours_per_mm=hpm, recons=recons,
@@ -361,8 +447,6 @@ def _run(argv=None) -> int:
 
     # --- 予測と出力(予測対象ごと) ---
     print(f"[5/5] 予測      対象 {len(targets)} 件: {', '.join(targets)}")
-    excl = [s.strip() for s in (a.exclude_group or "").split(";") if s.strip()]
-    out_dir = a.out_dir or os.path.join(ROOT, "output")
     base_params = {
         "実行日時": time.strftime("%Y-%m-%d %H:%M:%S"),
         "マスタ": ds.source.get("master", ""),
@@ -378,7 +462,16 @@ def _run(argv=None) -> int:
         "カーブ復元": recon,
         "カーブ解像度": n_bin,
         "人月換算係数": hpm,
+        "見積もりを使う": "ON" if use_estimates else "OFF",
+        "除外する行程グループ": ", ".join(excl) or "(なし)",
+        "立ち上がり上限": str(ds.settings["立ち上がり上限"]),
+        "立ち上がり上限の適用範囲": ramp_scope,
+        "段階予測の動作": phased_mode,
+        "段階予測の残工数": str(ds.settings["段階予測の残工数"]),
         "段階予測のマイルストーン": ms_mode,
+        "検証": "ON" if do_validate else "OFF",
+        "カーブ復元の比較": "ON" if compare_recon else "OFF",
+        "出力先フォルダ": out_dir,
         "実装範囲": "実装順序 1〜2(素朴版 + マイルストーン位置合わせ) + 見積もりによる総量指定",
         "未使用パラメータ": f"k={ds.settings['k']}, タグ重み係数={ds.settings['タグ重み係数']} "
                             f"(実装順序 3・4 で使用予定)",
@@ -412,7 +505,7 @@ def _run(argv=None) -> int:
                 recon=recon, warp_strength=warp_strength, max_stretch=max_stretch,
                 elasticity=elasticity,
                 ramp_spec=ramp_spec, ramp_all=ramp_all, ms_mode=ms_mode,
-                basis=BASIS_SCALED if a.remain_basis == "scaled" else BASIS_FIXED,
+                basis=basis, use_estimates=use_estimates, phased_mode=phased_mode,
                 excl=excl, args=a, base_warnings=warnings, base_params=base_params,
                 detail=detail, monthly=monthly, summary=summary,
                 out_dir=out_dir, stems=stems)
@@ -436,7 +529,8 @@ def _run(argv=None) -> int:
 
 def _run_one(target, *, ds, agg, model, model_naive, curves, groups, align, n_bin,
              backbone_spec, coverage, hpm, recon, warp_strength, max_stretch,
-             elasticity, ramp_spec, ramp_all, ms_mode, basis, excl, args, base_warnings,
+             elasticity, ramp_spec, ramp_all, ms_mode, basis, use_estimates,
+             phased_mode, excl, args, base_warnings,
              base_params, detail, monthly, summary, out_dir, stems) -> str:
     """1案件分の予測・段階予測・Excel出力。戻り値は書き出したパス。
 
@@ -453,7 +547,7 @@ def _run_one(target, *, ds, agg, model, model_naive, curves, groups, align, n_bi
 
     # 着手前の案件は実績が1行も無く、分かっているのは要素別の見積もりだけになる。
     # 見積もりがあればそれをグループ別総量の正とし、無ければ契約人月を学習比率で割る。
-    est = {} if args.ignore_estimates else ds.estimates_of(target)
+    est = ds.estimates_of(target) if use_estimates else {}
     fc = forecast(model, ds, target, group_totals=est or None, exclude_groups=excl,
                   ramp_limit=ramp_all)
 
@@ -474,7 +568,8 @@ def _run_one(target, *, ds, agg, model, model_naive, curves, groups, align, n_bi
     has_actual = actual_table is not None and not actual_table.empty \
         and float(actual_table.to_numpy().sum()) > 0
     has_ms = not ds.milestones_of(target).empty
-    want_phased = args.phased == "on" or (args.phased == "auto" and has_actual and has_ms)
+    want_phased = (phased_mode == "ON"
+                   or (phased_mode == "自動" and has_actual and has_ms))
     phased = None
     if want_phased:
         try:
@@ -490,7 +585,7 @@ def _run_one(target, *, ds, agg, model, model_naive, curves, groups, align, n_bi
             msg = f"段階予測は作れませんでした: {e}"
             print(f"        [警告] {msg}")
             warnings.append(msg)
-    elif args.phased == "auto" and not (has_actual and has_ms):
+    elif phased_mode == "自動" and not (has_actual and has_ms):
         lack = "実績" if not has_actual else "マイルストーン"
         print(f"        段階予測なし({lack}が無い。--phased on で強制)")
 
